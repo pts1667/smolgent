@@ -15,7 +15,9 @@ pub use chat::{
 pub use error::{Error, Result};
 pub use provider::{ApiKeyRef, ChatProvider, ProviderConfig, ProviderKind};
 pub use secrets::{KeyringCoreSecretStore, SecretStore, native_credential_store};
-pub use session::{ChatSession, SessionTurn};
+pub use session::{
+    AgentEvent, AgentEventReceiver, ChatSession, NotificationConfig, SessionConfig, SessionTurn,
+};
 pub use state::AgentState;
 pub use tools::builtin::{
     ApplyPatchArgs, ReadArgs, RgArgs, apply_patch_tool, builtin_registry, read_tool, ripgrep_tool,

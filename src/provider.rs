@@ -63,6 +63,7 @@ impl ProviderConfig {
     }
 }
 
+#[derive(Clone)]
 pub struct ChatProvider {
     client: reqwest::Client,
     config: ProviderConfig,

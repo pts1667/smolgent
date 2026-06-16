@@ -1,6 +1,7 @@
 use std::env;
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -16,19 +17,18 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use serde_json::Value;
 use smolgent::{
-    AgentState, ApiKeyRef, ChatProvider, ChatResponse, ChatSession, Error, ProviderConfig,
-    ToolCall, ToolRegistry, builtin_registry,
+    AgentEvent, AgentEventReceiver, AgentState, ApiKeyRef, ChatProvider, ChatResponse, ChatSession,
+    Error, NotificationConfig, ProviderConfig, SessionConfig, builtin_registry,
 };
 
 const MODEL: &str = "deepseek/deepseek-v4-flash";
-const MAX_TOOL_ROUNDS: usize = 8;
 
 /**
  * Example of a full CLI app for using smolagent.
  * Some notes:
  *  1. OPENROUTER_API_KEY is fetched from environment variables, but you should really be using the keyring store.
  *  2. The TUI is kinda crap, for example you can't really scroll "all the way" and there are issues with the input box. Polish isn't really the point
- *  */ 
+ *  */
 
 #[tokio::main]
 async fn main() -> smolgent::Result<()> {
@@ -58,12 +58,47 @@ async fn run_app(
     let display_input_dir = user_facing_path(&input_dir);
     let registry = builtin_registry(state);
     let provider = openrouter_provider(api_key)?;
-    let mut session = ChatSession::with_system_prompt(system_prompt(&display_input_dir, read_only));
+    let (session, events) = ChatSession::with_system_prompt_and_config(
+        system_prompt(&display_input_dir, read_only),
+        SessionConfig {
+            notifications: NotificationConfig::all(),
+            ..SessionConfig::default()
+        },
+    );
+    let events = events.expect("all notifications should create an event stream");
+    let statuses = spawn_agent_status_thread(events);
+    let mut session = Some(session);
+    let mut running: Option<RunningAnswer> = None;
     let mut app = AppState::new(display_input_dir, read_only);
 
     draw(&mut terminal, &app)?;
 
     loop {
+        drain_agent_statuses(&statuses, &mut app);
+        if let Some(answer) = &running
+            && answer.handle.is_finished()
+        {
+            let answer: RunningAnswer = running.take().unwrap();
+            let (returned_session, result) = answer
+                .handle
+                .await
+                .map_err(|err| Error::Tool(format!("agent task failed: {err}")))?;
+            session = Some(returned_session);
+
+            match result {
+                Ok(response) => {
+                    drain_agent_statuses(&statuses, &mut app);
+                    app.set_status("ready");
+                    app.push_chat("Assistant", response.message.content);
+                }
+                Err(err) => {
+                    drain_agent_statuses(&statuses, &mut app);
+                    app.set_status(format!("error: {err}"));
+                    app.push_chat("Error", err.to_string());
+                }
+            }
+        }
+
         if event::poll(Duration::from_millis(100))? {
             let Event::Key(key) = event::read()? else {
                 continue;
@@ -104,6 +139,11 @@ async fn run_app(
                     app.scroll_chat_bottom();
                 }
                 KeyCode::Enter => {
+                    drain_agent_statuses(&statuses, &mut app);
+                    if running.is_some() {
+                        app.push_status("assistant is still working");
+                        continue;
+                    }
                     let prompt = app.input.trim().to_string();
                     if prompt.is_empty() {
                         continue;
@@ -113,19 +153,19 @@ async fn run_app(
                     app.set_status("waiting for model...");
                     draw(&mut terminal, &app)?;
 
-                    if let Err(err) = answer_question(
-                        &provider,
-                        &registry,
-                        &mut session,
-                        &mut app,
-                        &mut terminal,
-                        prompt,
-                    )
-                    .await
-                    {
-                        app.set_status(format!("error: {err}"));
-                        app.push_chat("Error", err.to_string());
-                    }
+                    let mut active_session = session
+                        .take()
+                        .expect("session should be available when no answer is running");
+                    let provider = provider.clone();
+                    let registry = registry.clone();
+                    running = Some(RunningAnswer {
+                        handle: tokio::spawn(async move {
+                            let result = active_session
+                                .run_user_message_with_tools(&provider, &registry, prompt)
+                                .await;
+                            (active_session, result)
+                        }),
+                    });
                 }
                 _ => {}
             }
@@ -135,65 +175,20 @@ async fn run_app(
     }
 }
 
-async fn answer_question(
-    provider: &ChatProvider,
-    registry: &ToolRegistry,
-    session: &mut ChatSession,
-    app: &mut AppState,
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    prompt: String,
-) -> smolgent::Result<()> {
-    session.push_user(prompt);
-
-    for _ in 0..MAX_TOOL_ROUNDS {
-        let response = session.complete_with_tools(provider, registry).await?;
-        if response.message.tool_calls.is_empty() {
-            app.set_status("ready");
-            app.push_chat("Assistant", response.message.content);
-            draw(terminal, app)?;
-            return Ok(());
-        }
-
-        app.push_status(format!(
-            "model requested {} tool call(s)",
-            response.message.tool_calls.len()
-        ));
-        execute_tool_calls_with_status(registry, session, &response, app, terminal).await?;
-        app.set_status("waiting for model...");
-        draw(terminal, app)?;
-    }
-
-    Err(Error::Tool(format!(
-        "stopped after {MAX_TOOL_ROUNDS} tool rounds without a final answer"
-    )))
+struct RunningAnswer {
+    handle: tokio::task::JoinHandle<(ChatSession, smolgent::Result<ChatResponse>)>,
 }
 
-async fn execute_tool_calls_with_status(
-    registry: &ToolRegistry,
-    session: &mut ChatSession,
-    response: &ChatResponse,
-    app: &mut AppState,
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-) -> smolgent::Result<()> {
-    for call in &response.message.tool_calls {
-        let status = tool_status(call);
-        app.set_status(status.clone());
-        app.push_status(status);
-        draw(terminal, app)?;
-
-        let result = registry.execute_call_reporting_errors(call).await;
-        if result.content.starts_with("Tool error:") {
-            app.push_status(format!("{} failed: {}", result.name, result.content));
-        } else {
-            app.push_status(format!(
-                "{} returned {} byte(s)",
-                result.name,
-                result.content.len()
-            ));
+fn spawn_agent_status_thread(events: AgentEventReceiver) -> Receiver<String> {
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        while let Ok(event) = events.recv() {
+            if sender.send(agent_event_status(&event)).is_err() {
+                break;
+            }
         }
-        session.push(result.into_message());
-    }
-    Ok(())
+    });
+    receiver
 }
 
 fn openrouter_provider(api_key: String) -> smolgent::Result<ChatProvider> {
@@ -231,9 +226,48 @@ fn strip_windows_verbatim_prefix(path: &Path) -> PathBuf {
     }
 }
 
-fn tool_status(call: &ToolCall) -> String {
-    let args = serde_json::from_str::<Value>(&call.function.arguments).unwrap_or(Value::Null);
-    match call.function.name.as_str() {
+fn drain_agent_statuses(statuses: &Receiver<String>, app: &mut AppState) {
+    while let Ok(status) = statuses.try_recv() {
+        app.set_status(status.clone());
+        app.push_status(status);
+    }
+}
+
+fn agent_event_status(event: &AgentEvent) -> String {
+    match event {
+        AgentEvent::ModelRequestStarted {
+            completed_tool_rounds,
+        } => {
+            if *completed_tool_rounds == 0 {
+                "waiting for model...".to_string()
+            } else {
+                format!("waiting for model after {completed_tool_rounds} tool round(s)...")
+            }
+        }
+        AgentEvent::ModelResponseReceived { tool_calls, .. } => {
+            format!("model requested {tool_calls} tool call(s)")
+        }
+        AgentEvent::ToolRoundStarted { round, tool_calls } => {
+            format!("starting tool round {round} with {tool_calls} call(s)")
+        }
+        AgentEvent::ToolCallStarted {
+            name, arguments, ..
+        } => tool_call_status(name, arguments),
+        AgentEvent::ToolCallFinished {
+            name, content_len, ..
+        } => {
+            format!("{name} returned {content_len} byte(s)")
+        }
+        AgentEvent::ToolCallFailed { name, error, .. } => format!("{name} failed: {error}"),
+        AgentEvent::MaxToolRoundsReached { max_tool_rounds } => {
+            format!("stopped after {max_tool_rounds} tool rounds")
+        }
+    }
+}
+
+fn tool_call_status(name: &str, arguments: &str) -> String {
+    let args = serde_json::from_str::<Value>(arguments).unwrap_or(Value::Null);
+    match name {
         "read" => format!("reading {}", json_path(&args, "path")),
         "ripgrep" => {
             let pattern = args
@@ -518,7 +552,6 @@ fn chat_line_count(chat: &[ChatEntry]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use smolgent::ToolCallFunction;
 
     #[test]
     fn parses_args() {
@@ -534,27 +567,13 @@ mod tests {
 
     #[test]
     fn formats_read_status() {
-        let status = tool_status(&ToolCall {
-            id: "call_1".to_string(),
-            kind: "function".to_string(),
-            function: ToolCallFunction {
-                name: "read".to_string(),
-                arguments: r#"{"path":"src/lib.rs"}"#.to_string(),
-            },
-        });
+        let status = tool_call_status("read", r#"{"path":"src/lib.rs"}"#);
         assert_eq!(status, "reading src/lib.rs");
     }
 
     #[test]
     fn formats_ripgrep_status() {
-        let status = tool_status(&ToolCall {
-            id: "call_1".to_string(),
-            kind: "function".to_string(),
-            function: ToolCallFunction {
-                name: "ripgrep".to_string(),
-                arguments: r#"{"pattern":"ProviderConfig","paths":["src"]}"#.to_string(),
-            },
-        });
+        let status = tool_call_status("ripgrep", r#"{"pattern":"ProviderConfig","paths":["src"]}"#);
         assert_eq!(status, "searching src for \"ProviderConfig\"");
     }
 
