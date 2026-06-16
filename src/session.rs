@@ -1,5 +1,5 @@
 use crate::Result;
-use crate::chat::{ChatMessage, ChatResponse, MessageRole, ReasoningPayload};
+use crate::chat::{ChatMessage, ChatResponse, MessageRole, ReasoningPayload, ToolCall};
 use crate::provider::ChatProvider;
 use crate::tools::{ToolRegistry, ToolResult};
 
@@ -8,26 +8,37 @@ pub struct SessionTurn {
     pub role: MessageRole,
     pub content: String,
     pub reasoning: Option<ReasoningPayload>,
+    pub tool_calls: Vec<ToolCall>,
+    pub tool_call_id: Option<String>,
+    pub name: Option<String>,
 }
 
 impl From<ChatMessage> for SessionTurn {
     fn from(message: ChatMessage) -> Self {
+        let reasoning = ReasoningPayload {
+            reasoning: message.reasoning,
+            reasoning_content: message.reasoning_content,
+            reasoning_details: message.reasoning_details,
+        }
+        .into_option();
+
         Self {
             role: message.role,
             content: message.content,
-            reasoning: ReasoningPayload {
-                reasoning: message.reasoning,
-                reasoning_content: message.reasoning_content,
-                reasoning_details: message.reasoning_details,
-            }
-            .into_option(),
+            reasoning,
+            tool_calls: message.tool_calls,
+            tool_call_id: message.tool_call_id,
+            name: message.name,
         }
     }
 }
 
 impl From<SessionTurn> for ChatMessage {
     fn from(turn: SessionTurn) -> Self {
-        let message = ChatMessage::new(turn.role, turn.content);
+        let mut message = ChatMessage::new(turn.role, turn.content);
+        message.tool_calls = turn.tool_calls;
+        message.tool_call_id = turn.tool_call_id;
+        message.name = turn.name;
         match turn.reasoning {
             Some(reasoning) => message.with_reasoning(reasoning),
             None => message,
@@ -113,6 +124,20 @@ impl ChatSession {
         }
         Ok(results)
     }
+
+    pub async fn execute_tool_calls_reporting_errors(
+        &mut self,
+        registry: &ToolRegistry,
+        response: &ChatResponse,
+    ) -> Vec<ToolResult> {
+        let results = registry
+            .execute_calls_reporting_errors(&response.message.tool_calls)
+            .await;
+        for result in &results {
+            self.push(result.clone().into_message());
+        }
+        results
+    }
 }
 
 #[cfg(test)]
@@ -120,6 +145,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::chat::ToolCallFunction;
 
     #[test]
     fn sessions_preserve_reasoning_in_history() {
@@ -142,5 +168,61 @@ mod tests {
             message.reasoning_details,
             Some(json!([{ "type": "reasoning.text" }]))
         );
+    }
+
+    #[test]
+    fn sessions_preserve_tool_call_history() {
+        let mut session = ChatSession::new();
+        session.push(ChatMessage::assistant("").with_tool_calls(vec![ToolCall {
+            id: "call_1".to_string(),
+            kind: "function".to_string(),
+            function: ToolCallFunction {
+                name: "read".to_string(),
+                arguments: r#"{"path":"Cargo.toml"}"#.to_string(),
+            },
+        }]));
+        session.push(ChatMessage::tool_result(
+            "call_1",
+            "read",
+            "[package]\nname = \"smolgent\"\n",
+        ));
+
+        let messages = session.messages();
+
+        assert_eq!(messages[0].tool_calls.len(), 1);
+        assert_eq!(messages[0].tool_calls[0].id, "call_1");
+        assert_eq!(messages[1].tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(messages[1].name.as_deref(), Some("read"));
+    }
+
+    #[tokio::test]
+    async fn sessions_can_record_tool_errors_without_failing() {
+        let mut session = ChatSession::new();
+        let response = ChatResponse {
+            message: ChatMessage::assistant("").with_tool_calls(vec![ToolCall {
+                id: "call_1".to_string(),
+                kind: "function".to_string(),
+                function: ToolCallFunction {
+                    name: "read".to_string(),
+                    arguments: r#"{"path":"Cargo.toml"}"#.to_string(),
+                },
+            }]),
+            reasoning: None,
+            raw: json!({}),
+        };
+
+        let results = session
+            .execute_tool_calls_reporting_errors(&ToolRegistry::new(), &response)
+            .await;
+        let messages = session.messages();
+
+        assert_eq!(results.len(), 1);
+        assert!(
+            results[0]
+                .content
+                .contains("Tool error: unknown tool 'read'")
+        );
+        assert_eq!(messages[0].tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(messages[0].name.as_deref(), Some("read"));
     }
 }

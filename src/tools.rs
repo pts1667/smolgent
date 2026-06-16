@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -91,6 +92,16 @@ pub struct ToolResult {
 }
 
 impl ToolResult {
+    pub fn error(call: &ToolCall, error: impl fmt::Display) -> Self {
+        Self {
+            tool_call_id: call.id.clone(),
+            name: call.function.name.clone(),
+            content: format!(
+                "Tool error: {error}\nPlease correct the tool call arguments and try again."
+            ),
+        }
+    }
+
     pub fn into_message(self) -> ChatMessage {
         ChatMessage {
             role: MessageRole::Tool,
@@ -149,12 +160,27 @@ impl ToolRegistry {
         })
     }
 
+    pub async fn execute_call_reporting_errors(&self, call: &ToolCall) -> ToolResult {
+        match self.execute_call(call).await {
+            Ok(result) => result,
+            Err(error) => ToolResult::error(call, error),
+        }
+    }
+
     pub async fn execute_calls(&self, calls: &[ToolCall]) -> Result<Vec<ToolResult>> {
         let mut results = Vec::with_capacity(calls.len());
         for call in calls {
             results.push(self.execute_call(call).await?);
         }
         Ok(results)
+    }
+
+    pub async fn execute_calls_reporting_errors(&self, calls: &[ToolCall]) -> Vec<ToolResult> {
+        let mut results = Vec::with_capacity(calls.len());
+        for call in calls {
+            results.push(self.execute_call_reporting_errors(call).await);
+        }
+        results
     }
 }
 
@@ -217,5 +243,31 @@ mod tests {
 
         assert_eq!(result.tool_call_id, "call_1");
         assert_eq!(result.content, "5");
+    }
+
+    #[tokio::test]
+    async fn registry_reports_tool_errors_as_tool_results() {
+        let registry = ToolRegistry::new();
+        let call = ToolCall {
+            id: "call_1".to_string(),
+            kind: "function".to_string(),
+            function: ToolCallFunction {
+                name: "missing".to_string(),
+                arguments: "{}".to_string(),
+            },
+        };
+
+        let result = registry.execute_call_reporting_errors(&call).await;
+        let message = result.clone().into_message();
+
+        assert_eq!(result.tool_call_id, "call_1");
+        assert_eq!(result.name, "missing");
+        assert!(
+            result
+                .content
+                .contains("Tool error: unknown tool 'missing'")
+        );
+        assert_eq!(message.tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(message.name.as_deref(), Some("missing"));
     }
 }

@@ -158,7 +158,7 @@ pub fn builtin_registry(state: AgentState) -> crate::ToolRegistry {
 
 fn read(state: &AgentState, args: ReadArgs) -> Result<String> {
     ensure_can_read(state, &args.path)?;
-    Ok(std::fs::read_to_string(args.path)?)
+    Ok(std::fs::read_to_string(tool_path(&args.path))?)
 }
 
 fn ripgrep(state: &AgentState, args: RgArgs) -> Result<String> {
@@ -207,13 +207,13 @@ fn ripgrep(state: &AgentState, args: RgArgs) -> Result<String> {
         }
         command.arg(args.pattern.unwrap_or_default());
     }
-    command.args(args.paths);
+    command.args(args.paths.iter().map(|path| tool_path(path)));
 
     let output = command.output()?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = sanitize_tool_output(&String::from_utf8_lossy(&output.stdout));
+    let stderr = sanitize_tool_output(&String::from_utf8_lossy(&output.stderr));
     if output.status.success() {
-        return Ok(stdout.into_owned());
+        return Ok(stdout);
     }
     if output.status.code() == Some(1) {
         return Ok(format!("{stdout}{stderr}"));
@@ -238,27 +238,29 @@ fn apply_patch(state: &AgentState, args: ApplyPatchArgs) -> Result<String> {
     for operation in operations {
         match operation {
             PatchOperation::Add { path, lines } => {
-                if path.exists() {
+                let fs_path = tool_path(&path);
+                if fs_path.exists() {
                     return Err(Error::Tool(format!(
                         "cannot add file that already exists: {}",
-                        path.display()
+                        display_path(&path)
                     )));
                 }
-                if let Some(parent) = path.parent() {
+                if let Some(parent) = fs_path.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
-                std::fs::write(&path, lines_to_text(&lines))?;
-                changed.push(format!("added {}", path.display()));
+                std::fs::write(&fs_path, lines_to_text(&lines))?;
+                changed.push(format!("added {}", display_path(&path)));
             }
             PatchOperation::Delete { path } => {
-                std::fs::remove_file(&path)?;
-                changed.push(format!("deleted {}", path.display()));
+                std::fs::remove_file(tool_path(&path))?;
+                changed.push(format!("deleted {}", display_path(&path)));
             }
             PatchOperation::Update { path, hunks } => {
-                let original = std::fs::read_to_string(&path)?;
+                let fs_path = tool_path(&path);
+                let original = std::fs::read_to_string(&fs_path)?;
                 let updated = apply_hunks(&original, &hunks)?;
-                std::fs::write(&path, updated)?;
-                changed.push(format!("updated {}", path.display()));
+                std::fs::write(&fs_path, updated)?;
+                changed.push(format!("updated {}", display_path(&path)));
             }
         }
     }
@@ -271,7 +273,7 @@ fn ensure_can_read(state: &AgentState, path: &Path) -> Result<()> {
         Ok(())
     } else {
         Err(Error::PathNotAllowed {
-            path: path.display().to_string(),
+            path: display_path(path),
             access: "read",
         })
     }
@@ -282,9 +284,32 @@ fn ensure_can_write(state: &AgentState, path: &Path) -> Result<()> {
         Ok(())
     } else {
         Err(Error::PathNotAllowed {
-            path: path.display().to_string(),
+            path: display_path(path),
             access: "write",
         })
+    }
+}
+
+fn tool_path(path: &Path) -> PathBuf {
+    strip_windows_verbatim_prefix(path)
+}
+
+fn display_path(path: &Path) -> String {
+    strip_windows_verbatim_prefix(path).display().to_string()
+}
+
+fn sanitize_tool_output(output: &str) -> String {
+    output.replace(r"\\?\UNC\", r"\\").replace(r"\\?\", "")
+}
+
+fn strip_windows_verbatim_prefix(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{rest}"))
+    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
+        PathBuf::from(rest)
+    } else {
+        path.to_path_buf()
     }
 }
 
