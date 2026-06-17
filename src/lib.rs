@@ -28,7 +28,8 @@ pub use session::{
 };
 pub use state::AgentState;
 pub use tools::builtin::{
-    ApplyPatchArgs, ReadArgs, RgArgs, apply_patch_tool, builtin_registry, read_tool, ripgrep_tool,
+    ApplyPatchArgs, CreateFileArgs, DeleteFileArgs, ReadArgs, RgArgs, apply_patch_tool,
+    builtin_registry, create_file_tool, delete_file_tool, read_tool, ripgrep_tool,
 };
 pub use tools::{FunctionToolDefinition, Tool, ToolDefinition, ToolRegistry, ToolResult};
 

@@ -17,6 +17,27 @@ Required parameters:
 Example:
 {"path":"src/lib.rs"}"#;
 
+const CREATE_FILE_DESCRIPTION: &str = r#"Create a UTF-8 text file under an allowed write root.
+
+Required parameters:
+- path: file path to create. Relative paths are resolved from the current process directory.
+- content: complete file contents to write.
+
+Optional parameters:
+- overwrite: true to replace an existing file. Defaults to false.
+- create_parent_dirs: true to create missing parent directories. Defaults to true.
+
+Example:
+{"path":"notes/todo.txt","content":"- first task\n"}"#;
+
+const DELETE_FILE_DESCRIPTION: &str = r#"Delete a file under an allowed write root.
+
+Required parameters:
+- path: file path to delete. The path must refer to an existing file, not a directory.
+
+Example:
+{"path":"notes/old.txt"}"#;
+
 const APPLY_PATCH_DESCRIPTION: &str = r#"Apply a small patch to files under allowed write roots.
 
 Required parameters:
@@ -61,6 +82,26 @@ Examples:
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 pub struct ReadArgs {
     /// File path to read. Relative paths are resolved from the current process directory.
+    pub path: PathBuf,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+pub struct CreateFileArgs {
+    /// File path to create. Relative paths are resolved from the current process directory.
+    pub path: PathBuf,
+    /// Complete UTF-8 text contents to write.
+    pub content: String,
+    /// Replace an existing file instead of failing.
+    #[serde(default)]
+    pub overwrite: bool,
+    /// Create missing parent directories before writing.
+    #[serde(default = "default_true")]
+    pub create_parent_dirs: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+pub struct DeleteFileArgs {
+    /// File path to delete. The path must refer to an existing file, not a directory.
     pub path: PathBuf,
 }
 
@@ -116,6 +157,40 @@ pub fn read_tool(state: AgentState) -> Tool {
     )
 }
 
+pub fn create_file_tool(state: AgentState) -> Tool {
+    Tool::new(
+        ToolDefinition::new(
+            "create_file",
+            CREATE_FILE_DESCRIPTION,
+            schemars::schema_for!(CreateFileArgs),
+        ),
+        move |arguments| {
+            let state = state.clone();
+            Box::pin(async move {
+                let args: CreateFileArgs = serde_json::from_value(arguments)?;
+                create_file(&state, args).map(serde_json::Value::String)
+            })
+        },
+    )
+}
+
+pub fn delete_file_tool(state: AgentState) -> Tool {
+    Tool::new(
+        ToolDefinition::new(
+            "delete_file",
+            DELETE_FILE_DESCRIPTION,
+            schemars::schema_for!(DeleteFileArgs),
+        ),
+        move |arguments| {
+            let state = state.clone();
+            Box::pin(async move {
+                let args: DeleteFileArgs = serde_json::from_value(arguments)?;
+                delete_file(&state, args).map(serde_json::Value::String)
+            })
+        },
+    )
+}
+
 pub fn apply_patch_tool(state: AgentState) -> Tool {
     Tool::new(
         ToolDefinition::new(
@@ -153,6 +228,8 @@ pub fn ripgrep_tool(state: AgentState) -> Tool {
 pub fn builtin_registry(state: AgentState) -> crate::ToolRegistry {
     crate::ToolRegistry::new()
         .with_tool(read_tool(state.clone()))
+        .with_tool(create_file_tool(state.clone()))
+        .with_tool(delete_file_tool(state.clone()))
         .with_tool(apply_patch_tool(state.clone()))
         .with_tool(ripgrep_tool(state))
 }
@@ -160,6 +237,43 @@ pub fn builtin_registry(state: AgentState) -> crate::ToolRegistry {
 fn read(state: &AgentState, args: ReadArgs) -> Result<String> {
     let path = ensure_can_read(state, &args.path)?;
     Ok(std::fs::read_to_string(tool_path(&path))?)
+}
+
+fn create_file(state: &AgentState, args: CreateFileArgs) -> Result<String> {
+    let path = ensure_can_write(state, &args.path)?;
+    let fs_path = tool_path(&path);
+    if fs_path.try_exists()? && !args.overwrite {
+        return Err(Error::Tool(format!(
+            "cannot create file that already exists without overwrite=true: {}",
+            display_path(&path)
+        )));
+    }
+    if let Some(parent) = fs_path.parent()
+        && args.create_parent_dirs
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&fs_path, args.content)?;
+    Ok(format!("created {}", display_path(&path)))
+}
+
+fn delete_file(state: &AgentState, args: DeleteFileArgs) -> Result<String> {
+    let path = ensure_can_write(state, &args.path)?;
+    let fs_path = tool_path(&path);
+    if !fs_path.try_exists()? {
+        return Err(Error::Tool(format!(
+            "cannot delete missing file: {}",
+            display_path(&path)
+        )));
+    }
+    if fs_path.is_dir() {
+        return Err(Error::Tool(format!(
+            "delete_file only deletes files, not directories: {}",
+            display_path(&path)
+        )));
+    }
+    std::fs::remove_file(&fs_path)?;
+    Ok(format!("deleted {}", display_path(&path)))
 }
 
 fn ripgrep(state: &AgentState, args: RgArgs) -> Result<String> {
@@ -584,6 +698,10 @@ fn lines_to_text(lines: &[String]) -> String {
     text
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -642,6 +760,104 @@ mod tests {
             .unwrap();
 
         assert!(output.as_str().unwrap().contains("ToolRegistry"));
+    }
+
+    #[tokio::test]
+    async fn create_and_delete_file_tools_validate_write_roots() {
+        let temp = tempfile::tempdir().unwrap();
+        let allowed = temp.path().join("allowed");
+        let denied = temp.path().join("denied");
+        std::fs::create_dir_all(&allowed).unwrap();
+        std::fs::create_dir_all(&denied).unwrap();
+        let file = allowed.join("nested").join("note.txt");
+        let denied_file = denied.join("note.txt");
+        let registry = ToolRegistry::new()
+            .with_tool(create_file_tool(AgentState::new([], [allowed.clone()])))
+            .with_tool(delete_file_tool(AgentState::new([], [allowed.clone()])));
+
+        let created = registry
+            .get("create_file")
+            .unwrap()
+            .call(json!({
+                "path": file,
+                "content": "hello\n"
+            }))
+            .await
+            .unwrap();
+        assert!(created.as_str().unwrap().contains("created"));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello\n");
+
+        let duplicate = registry
+            .get("create_file")
+            .unwrap()
+            .call(json!({
+                "path": file,
+                "content": "replacement\n"
+            }))
+            .await
+            .unwrap_err();
+        assert!(duplicate.to_string().contains("overwrite=true"));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello\n");
+
+        registry
+            .get("create_file")
+            .unwrap()
+            .call(json!({
+                "path": file,
+                "content": "replacement\n",
+                "overwrite": true
+            }))
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "replacement\n");
+
+        assert!(
+            registry
+                .get("create_file")
+                .unwrap()
+                .call(json!({
+                    "path": denied_file,
+                    "content": "nope\n"
+                }))
+                .await
+                .is_err()
+        );
+
+        let deleted = registry
+            .get("delete_file")
+            .unwrap()
+            .call(json!({ "path": file }))
+            .await
+            .unwrap();
+        assert!(deleted.as_str().unwrap().contains("deleted"));
+        assert!(!file.exists());
+    }
+
+    #[tokio::test]
+    async fn delete_file_tool_rejects_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("directory");
+        std::fs::create_dir_all(&dir).unwrap();
+        let registry = ToolRegistry::new()
+            .with_tool(delete_file_tool(AgentState::new([], [temp.path().into()])));
+
+        let error = registry
+            .get("delete_file")
+            .unwrap()
+            .call(json!({ "path": dir }))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("not directories"));
+        assert!(dir.exists());
+    }
+
+    #[test]
+    fn builtin_registry_includes_write_file_tools_by_default() {
+        let registry = builtin_registry(AgentState::default());
+
+        assert!(registry.get("create_file").is_some());
+        assert!(registry.get("delete_file").is_some());
     }
 
     #[tokio::test]
@@ -745,10 +961,26 @@ mod tests {
     fn builtin_tool_definitions_explain_parameters() {
         let state = AgentState::default();
         let read = read_tool(state.clone());
+        let create = create_file_tool(state.clone());
+        let delete = delete_file_tool(state.clone());
         let patch = apply_patch_tool(state.clone());
         let rg = ripgrep_tool(state);
 
         assert!(read.definition().function.description.contains("Example"));
+        assert!(
+            create
+                .definition()
+                .function
+                .description
+                .contains("overwrite")
+        );
+        assert!(
+            delete
+                .definition()
+                .function
+                .description
+                .contains("not a directory")
+        );
         assert!(
             patch
                 .definition()
