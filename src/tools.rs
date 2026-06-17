@@ -11,6 +11,8 @@ use crate::chat::{ChatMessage, MessageRole, ToolCall};
 use crate::{Error, Result};
 
 pub mod builtin;
+pub mod compact;
+pub mod file;
 
 pub type ToolFuture = Pin<Box<dyn Future<Output = Result<Value>> + Send>>;
 

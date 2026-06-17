@@ -24,7 +24,7 @@ use smolgent::{
 const MODEL: &str = "deepseek/deepseek-v4-flash";
 
 /**
- * Example of a full CLI app for using smolagent.
+ * Example of a full CLI app for using smolgent.
  * Some notes:
  *  1. OPENROUTER_API_KEY is fetched from environment variables, but you should really be using the keyring store.
  *  2. The TUI is kinda crap, for example you can't really scroll "all the way" and there are issues with the input box. Polish isn't really the point
@@ -206,7 +206,8 @@ fn system_prompt(input_dir: &Path, read_only: bool) -> String {
     format!(
         "You are a coding assistant helping the user understand this input directory: {}.\n\
          Use ripgrep to search, read to inspect specific files, and cite concrete paths in answers.\n\
-         Prefer targeted reads over dumping many large files. Use ordinary Windows paths; do not add a \\\\?\\ prefix. {write_note}",
+         Prefer targeted reads over dumping many large files. Use ordinary Windows paths; do not add a \\\\?\\ prefix.\n\
+         You may use compact_remove_messages and compact_summarize_messages to keep context tidy, especially after old read or ripgrep output is no longer useful. {write_note}",
         input_dir.display()
     )
 }
@@ -262,7 +263,49 @@ fn agent_event_status(event: &AgentEvent) -> String {
         AgentEvent::MaxToolRoundsReached { max_tool_rounds } => {
             format!("stopped after {max_tool_rounds} tool rounds")
         }
+        AgentEvent::CompactionStarted {
+            estimated_tokens,
+            target_estimated_tokens,
+        } => format!(
+            "compacting context: {estimated_tokens} estimated tokens, target {target_estimated_tokens}"
+        ),
+        AgentEvent::CompactionBreakdown {
+            largest_turns,
+            largest_tool_calls,
+            ..
+        } => format!(
+            "largest context items: {} turn(s), {} tool call group(s)",
+            largest_turns.len(),
+            largest_tool_calls.len()
+        ),
+        AgentEvent::CompactionToolCallStarted {
+            name, arguments, ..
+        } => {
+            format!("running {name}: {}", compact_status_args(arguments))
+        }
+        AgentEvent::CompactionFinished {
+            before_estimated_tokens,
+            after_estimated_tokens,
+            rounds,
+        } => format!(
+            "compaction finished after {rounds} round(s): {before_estimated_tokens} -> {after_estimated_tokens} estimated tokens"
+        ),
+        AgentEvent::CompactionSkipped { reason } => format!("compaction skipped: {reason}"),
     }
+}
+
+fn compact_status_args(arguments: &str) -> String {
+    let args = serde_json::from_str::<Value>(arguments).unwrap_or(Value::Null);
+    let turn_count = args
+        .get("turn_ids")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    let reason = args
+        .get("reason")
+        .and_then(Value::as_str)
+        .unwrap_or("no reason");
+    format!("{turn_count} turn(s), {reason}")
 }
 
 fn tool_call_status(name: &str, arguments: &str) -> String {
@@ -477,7 +520,7 @@ impl AppState {
         };
         app.push_chat(
             "System",
-            "Ask a question about the directory. The agent can search and read files.",
+            "Ask a question about the directory. The agent can search, read files, and compact old context.",
         );
         app
     }
@@ -575,6 +618,14 @@ mod tests {
     fn formats_ripgrep_status() {
         let status = tool_call_status("ripgrep", r#"{"pattern":"ProviderConfig","paths":["src"]}"#);
         assert_eq!(status, "searching src for \"ProviderConfig\"");
+    }
+
+    #[test]
+    fn system_prompt_mentions_compaction_tools() {
+        let prompt = system_prompt(Path::new("C:\\repo"), true);
+
+        assert!(prompt.contains("compact_remove_messages"));
+        assert!(prompt.contains("compact_summarize_messages"));
     }
 
     #[test]

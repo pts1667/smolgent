@@ -102,7 +102,16 @@ impl ChatProvider {
         messages: &[ChatMessage],
         tools: Vec<ToolDefinition>,
     ) -> Result<ChatResponse> {
-        let request = ChatRequest {
+        let request = self.build_request(messages, tools);
+        self.send_request(request).await
+    }
+
+    pub fn build_request(
+        &self,
+        messages: &[ChatMessage],
+        tools: Vec<ToolDefinition>,
+    ) -> ChatRequest {
+        ChatRequest {
             model: self.config.default_model.clone(),
             messages: messages.to_vec(),
             tools,
@@ -111,8 +120,7 @@ impl ChatProvider {
             max_tokens: None,
             reasoning: self.config.reasoning.clone(),
             response_format: None,
-        };
-        self.send_request(request).await
+        }
     }
 
     pub async fn send_request(&self, request: ChatRequest) -> Result<ChatResponse> {

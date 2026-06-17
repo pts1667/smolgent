@@ -28,8 +28,21 @@ You can always just use a .env file or even environment variables if you don't c
 - llama.cpp
 - Openrouter
 
+## Context Compaction
+
+Context compaction is enabled by default.
+Compaction can be done with a capable LLM during the running session, but is also requested at certain tokens counts.
+This behaviour is configurable, and can be disabled.
+
+Configure this with `SessionConfig::default().compaction`, or use `CompactionConfig::disabled()` to turn it off.
+
+## Telemetry
+
+Telemetry is opt-in and dependency-free.
+Configure `SessionConfig::telemetry` with `TelemetryConfig::messages()`, `TelemetryConfig::tools()`, or `TelemetryConfig::all()`, then create the session with `ChatSession::with_config_and_telemetry`.
+Payload capture is disabled unless you choose `TelemetryConfig::all()` or otherwise enable the payload flags.
+It is the responsibility of the user to actually log the provided content; the library only emits events.
+
 ## TODO
 
-- Context compaction
-- Logging
 - Multimodal input
