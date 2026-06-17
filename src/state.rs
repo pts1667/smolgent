@@ -33,17 +33,28 @@ impl AgentState {
     }
 
     pub fn can_read(&self, path: impl AsRef<Path>) -> bool {
-        is_under_any_root(path.as_ref(), &self.read_roots)
+        self.readable_path(path).is_some()
     }
 
     pub fn can_write(&self, path: impl AsRef<Path>) -> bool {
-        is_under_any_root(path.as_ref(), &self.write_roots)
+        self.writable_path(path).is_some()
+    }
+
+    pub fn readable_path(&self, path: impl AsRef<Path>) -> Option<PathBuf> {
+        path_under_any_root(path.as_ref(), &self.read_roots)
+    }
+
+    pub fn writable_path(&self, path: impl AsRef<Path>) -> Option<PathBuf> {
+        path_under_any_root(path.as_ref(), &self.write_roots)
     }
 }
 
-fn is_under_any_root(path: &Path, roots: &[PathBuf]) -> bool {
+fn path_under_any_root(path: &Path, roots: &[PathBuf]) -> Option<PathBuf> {
     let path = normalize_path(path);
-    roots.iter().any(|root| path.starts_with(root))
+    roots
+        .iter()
+        .any(|root| path.starts_with(root))
+        .then_some(path)
 }
 
 fn normalize_many(paths: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {

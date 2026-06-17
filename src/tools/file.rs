@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -157,8 +158,8 @@ pub fn builtin_registry(state: AgentState) -> crate::ToolRegistry {
 }
 
 fn read(state: &AgentState, args: ReadArgs) -> Result<String> {
-    ensure_can_read(state, &args.path)?;
-    Ok(std::fs::read_to_string(tool_path(&args.path))?)
+    let path = ensure_can_read(state, &args.path)?;
+    Ok(std::fs::read_to_string(tool_path(&path))?)
 }
 
 fn ripgrep(state: &AgentState, args: RgArgs) -> Result<String> {
@@ -172,9 +173,11 @@ fn ripgrep(state: &AgentState, args: RgArgs) -> Result<String> {
             "ripgrep requires `pattern` unless `files` is true".to_string(),
         ));
     }
-    for path in &args.paths {
-        ensure_can_read(state, path)?;
-    }
+    let paths = args
+        .paths
+        .iter()
+        .map(|path| ensure_can_read(state, path))
+        .collect::<Result<Vec<_>>>()?;
 
     let mut command = Command::new("rg");
     command.arg("--no-config");
@@ -207,7 +210,7 @@ fn ripgrep(state: &AgentState, args: RgArgs) -> Result<String> {
         }
         command.arg(args.pattern.unwrap_or_default());
     }
-    command.args(args.paths.iter().map(|path| tool_path(path)));
+    command.args(paths.iter().map(|path| tool_path(path)));
 
     let output = command.output()?;
     let stdout = sanitize_tool_output(&String::from_utf8_lossy(&output.stdout));
@@ -230,64 +233,61 @@ fn apply_patch(state: &AgentState, args: ApplyPatchArgs) -> Result<String> {
         return Err(Error::Tool("patch contained no operations".to_string()));
     }
 
-    for operation in &operations {
-        ensure_can_write(state, operation.path())?;
-    }
-
+    let mut staged = BTreeMap::new();
     let mut changed = Vec::new();
     for operation in operations {
+        let path = ensure_can_write(state, operation.path())?;
         match operation {
-            PatchOperation::Add { path, lines } => {
-                let fs_path = tool_path(&path);
-                if fs_path.exists() {
+            PatchOperation::Add { lines, .. } => {
+                if staged_file_exists(&staged, &path)? {
                     return Err(Error::Tool(format!(
                         "cannot add file that already exists: {}",
                         display_path(&path)
                     )));
                 }
-                if let Some(parent) = fs_path.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                std::fs::write(&fs_path, lines_to_text(&lines))?;
+                staged.insert(path.clone(), Some(lines_to_text(&lines)));
                 changed.push(format!("added {}", display_path(&path)));
             }
-            PatchOperation::Delete { path } => {
-                std::fs::remove_file(tool_path(&path))?;
+            PatchOperation::Delete { .. } => {
+                if !staged_file_exists(&staged, &path)? {
+                    return Err(Error::Tool(format!(
+                        "cannot delete missing file: {}",
+                        display_path(&path)
+                    )));
+                }
+                staged.insert(path.clone(), None);
                 changed.push(format!("deleted {}", display_path(&path)));
             }
-            PatchOperation::Update { path, hunks } => {
-                let fs_path = tool_path(&path);
-                let original = std::fs::read_to_string(&fs_path)?;
+            PatchOperation::Update { hunks, .. } => {
+                let original = staged_file_contents(&staged, &path)?;
                 let updated = apply_hunks(&original, &hunks)?;
-                std::fs::write(&fs_path, updated)?;
+                staged.insert(path.clone(), Some(updated));
                 changed.push(format!("updated {}", display_path(&path)));
             }
         }
     }
 
+    commit_staged_files(&staged)?;
+
     Ok(changed.join("\n"))
 }
 
-fn ensure_can_read(state: &AgentState, path: &Path) -> Result<()> {
-    if state.can_read(path) {
-        Ok(())
-    } else {
-        Err(Error::PathNotAllowed {
+fn ensure_can_read(state: &AgentState, path: &Path) -> Result<PathBuf> {
+    state
+        .readable_path(path)
+        .ok_or_else(|| Error::PathNotAllowed {
             path: display_path(path),
             access: "read",
         })
-    }
 }
 
-fn ensure_can_write(state: &AgentState, path: &Path) -> Result<()> {
-    if state.can_write(path) {
-        Ok(())
-    } else {
-        Err(Error::PathNotAllowed {
+fn ensure_can_write(state: &AgentState, path: &Path) -> Result<PathBuf> {
+    state
+        .writable_path(path)
+        .ok_or_else(|| Error::PathNotAllowed {
             path: display_path(path),
             access: "write",
         })
-    }
 }
 
 fn tool_path(path: &Path) -> PathBuf {
@@ -315,9 +315,17 @@ fn strip_windows_verbatim_prefix(path: &Path) -> PathBuf {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum PatchOperation {
-    Add { path: PathBuf, lines: Vec<String> },
-    Delete { path: PathBuf },
-    Update { path: PathBuf, hunks: Vec<HunkLine> },
+    Add {
+        path: PathBuf,
+        lines: Vec<String>,
+    },
+    Delete {
+        path: PathBuf,
+    },
+    Update {
+        path: PathBuf,
+        hunks: Vec<Vec<HunkLine>>,
+    },
 }
 
 impl PatchOperation {
@@ -372,10 +380,15 @@ fn parse_patch(patch: &str) -> Result<Vec<PatchOperation>> {
             index += 1;
         } else if let Some(path) = line.strip_prefix("*** Update File: ") {
             index += 1;
+            let mut hunks = Vec::new();
             let mut hunk_lines = Vec::new();
             while index < lines.len() - 1 && !lines[index].starts_with("*** ") {
                 let line = lines[index];
                 if line == "@@" || line.starts_with("@@ ") {
+                    if !hunk_lines.is_empty() {
+                        hunks.push(hunk_lines);
+                        hunk_lines = Vec::new();
+                    }
                     index += 1;
                     continue;
                 }
@@ -395,9 +408,15 @@ fn parse_patch(patch: &str) -> Result<Vec<PatchOperation>> {
                 }
                 index += 1;
             }
+            if !hunk_lines.is_empty() {
+                hunks.push(hunk_lines);
+            }
+            if hunks.is_empty() {
+                return Err(Error::Tool("update file contained no hunks".to_string()));
+            }
             operations.push(PatchOperation::Update {
                 path: PathBuf::from(path),
-                hunks: hunk_lines,
+                hunks,
             });
         } else if line.trim().is_empty() {
             index += 1;
@@ -409,21 +428,19 @@ fn parse_patch(patch: &str) -> Result<Vec<PatchOperation>> {
     Ok(operations)
 }
 
-fn apply_hunks(original: &str, hunk_lines: &[HunkLine]) -> Result<String> {
+fn apply_hunks(original: &str, hunks: &[Vec<HunkLine>]) -> Result<String> {
     let had_trailing_newline = original.ends_with('\n');
     let original_lines = original.lines().map(str::to_string).collect::<Vec<_>>();
     let mut output = Vec::new();
     let mut cursor = 0;
-    let mut index = 0;
 
-    while index < hunk_lines.len() {
+    for hunk_lines in hunks {
         let mut expected = Vec::new();
-        while index < hunk_lines.len() {
-            match &hunk_lines[index] {
+        for line in hunk_lines {
+            match line {
                 HunkLine::Context(line) | HunkLine::Remove(line) => expected.push(line.clone()),
                 HunkLine::Add(_) => {}
             }
-            index += 1;
         }
 
         let start = find_sequence(&original_lines, cursor, &expected)
@@ -448,10 +465,107 @@ fn apply_hunks(original: &str, hunk_lines: &[HunkLine]) -> Result<String> {
 
     output.extend_from_slice(&original_lines[cursor..]);
     let mut text = output.join("\n");
-    if had_trailing_newline || !text.is_empty() {
+    if had_trailing_newline && !text.is_empty() {
         text.push('\n');
     }
     Ok(text)
+}
+
+fn staged_file_exists(staged: &BTreeMap<PathBuf, Option<String>>, path: &Path) -> Result<bool> {
+    match staged.get(path) {
+        Some(Some(_)) => Ok(true),
+        Some(None) => Ok(false),
+        None => Ok(tool_path(path).try_exists()?),
+    }
+}
+
+fn staged_file_contents(staged: &BTreeMap<PathBuf, Option<String>>, path: &Path) -> Result<String> {
+    match staged.get(path) {
+        Some(Some(content)) => Ok(content.clone()),
+        Some(None) => Err(Error::Tool(format!(
+            "cannot update deleted file: {}",
+            display_path(path)
+        ))),
+        None => Ok(std::fs::read_to_string(tool_path(path))?),
+    }
+}
+
+#[derive(Clone, Debug)]
+enum FileSnapshot {
+    Missing,
+    File(String),
+}
+
+impl FileSnapshot {
+    fn capture(path: &Path) -> Result<Self> {
+        let fs_path = tool_path(path);
+        if fs_path.try_exists()? {
+            Ok(Self::File(std::fs::read_to_string(fs_path)?))
+        } else {
+            Ok(Self::Missing)
+        }
+    }
+
+    fn restore(&self, path: &Path) -> std::io::Result<()> {
+        let fs_path = tool_path(path);
+        match self {
+            Self::Missing => {
+                if fs_path.try_exists()? {
+                    std::fs::remove_file(fs_path)?;
+                }
+            }
+            Self::File(content) => {
+                if let Some(parent) = fs_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(fs_path, content)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn commit_staged_files(staged: &BTreeMap<PathBuf, Option<String>>) -> Result<()> {
+    let snapshots = staged
+        .keys()
+        .map(|path| Ok((path.clone(), FileSnapshot::capture(path)?)))
+        .collect::<Result<BTreeMap<_, _>>>()?;
+
+    for (path, content) in staged {
+        if let Err(error) = write_staged_file(path, content.as_deref()) {
+            if let Err(rollback_error) = rollback_staged_files(&snapshots) {
+                return Err(Error::Tool(format!(
+                    "patch failed: {error}; rollback failed: {rollback_error}"
+                )));
+            }
+            return Err(error);
+        }
+    }
+
+    Ok(())
+}
+
+fn write_staged_file(path: &Path, content: Option<&str>) -> Result<()> {
+    let fs_path = tool_path(path);
+    match content {
+        Some(content) => {
+            if let Some(parent) = fs_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(fs_path, content)?;
+        }
+        None => {
+            std::fs::remove_file(fs_path)?;
+        }
+    }
+    Ok(())
+}
+
+fn rollback_staged_files(snapshots: &BTreeMap<PathBuf, FileSnapshot>) -> std::io::Result<()> {
+    for (path, snapshot) in snapshots {
+        snapshot.restore(path)?;
+    }
+    Ok(())
 }
 
 fn find_sequence(lines: &[String], start: usize, expected: &[String]) -> Option<usize> {
@@ -551,6 +665,80 @@ mod tests {
             .unwrap();
 
         assert_eq!(std::fs::read_to_string(file).unwrap(), "New text\n");
+    }
+
+    #[tokio::test]
+    async fn apply_patch_tool_handles_multiple_disjoint_hunks() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("main.rs");
+        std::fs::write(&file, "foo\nunchanged\nbar\n").unwrap();
+        let registry = ToolRegistry::new()
+            .with_tool(apply_patch_tool(AgentState::new([], [temp.path().into()])));
+
+        registry
+            .get("apply_patch")
+            .unwrap()
+            .call(json!({
+                "patch": format!(
+                    "*** Begin Patch\n*** Update File: {}\n@@\n-foo\n+FOO\n@@\n-bar\n+BAR\n*** End Patch\n",
+                    file.display()
+                )
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(file).unwrap(),
+            "FOO\nunchanged\nBAR\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_patch_tool_rolls_back_failed_multi_operation_patch() {
+        let temp = tempfile::tempdir().unwrap();
+        let created = temp.path().join("created.txt");
+        let missing = temp.path().join("missing.txt");
+        let registry = ToolRegistry::new()
+            .with_tool(apply_patch_tool(AgentState::new([], [temp.path().into()])));
+
+        let error = registry
+            .get("apply_patch")
+            .unwrap()
+            .call(json!({
+                "patch": format!(
+                    "*** Begin Patch\n*** Add File: {}\n+new\n*** Delete File: {}\n*** End Patch\n",
+                    created.display(),
+                    missing.display()
+                )
+            }))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("cannot delete missing file"));
+        assert!(!created.exists());
+    }
+
+    #[tokio::test]
+    async fn apply_patch_tool_can_remove_all_content_without_leaving_newline() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("empty-me.txt");
+        std::fs::write(&file, "delete me\n").unwrap();
+        let registry = ToolRegistry::new()
+            .with_tool(apply_patch_tool(AgentState::new([], [temp.path().into()])));
+
+        registry
+            .get("apply_patch")
+            .unwrap()
+            .call(json!({
+                "patch": format!(
+                    "*** Begin Patch\n*** Update File: {}\n@@\n-delete me\n*** End Patch\n",
+                    file.display()
+                )
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "");
     }
 
     #[test]

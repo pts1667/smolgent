@@ -546,6 +546,109 @@ async fn managed_tool_loop_runs_tools_and_emits_events() {
 }
 
 #[tokio::test]
+async fn managed_tool_loop_runs_mixed_compaction_and_registry_tools() {
+    let server = MockServer::start();
+    let tool_call_mock = server.mock(|when, then| {
+        when.method(POST)
+            .path("/v1/chat/completions")
+            .body_contains("\"messages\":[{\"role\":\"user\",\"content\":\"old context\"},{\"role\":\"user\",\"content\":\"add 2 and 3\"}]")
+            .body_contains(COMPACT_SUMMARIZE_MESSAGES)
+            .body_contains("\"name\":\"add\"");
+        then.status(200).json_body(json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [
+                        {
+                            "id": "compact_1",
+                            "type": "function",
+                            "function": {
+                                "name": COMPACT_SUMMARIZE_MESSAGES,
+                                "arguments": "{\"turn_ids\":[1],\"summary\":\"The user mentioned old context.\",\"reason\":\"keep context short\"}"
+                            }
+                        },
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "add",
+                                "arguments": "{\"a\":2,\"b\":3}"
+                            }
+                        }
+                    ]
+                }
+            }]
+        }));
+    });
+    let final_mock = server.mock(|when, then| {
+        when.method(POST)
+            .path("/v1/chat/completions")
+            .body_contains("\"role\":\"tool\"")
+            .body_contains("Compaction acknowledged:")
+            .body_contains("\"content\":\"5\"");
+        then.status(200).json_body(json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "2 + 3 = 5"
+                }
+            }]
+        }));
+    });
+
+    let provider =
+        ChatProvider::new(ProviderConfig::llama_cpp(server.base_url(), "local-model").unwrap());
+    let registry = ToolRegistry::new().with_tool(Tool::new(
+        ToolDefinition::new(
+            "add",
+            "Add two numbers.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "a": { "type": "integer" },
+                    "b": { "type": "integer" }
+                },
+                "required": ["a", "b"]
+            }),
+        ),
+        |arguments| {
+            Box::pin(async move {
+                Ok(json!(
+                    arguments["a"].as_i64().unwrap() + arguments["b"].as_i64().unwrap()
+                ))
+            })
+        },
+    ));
+    let (mut session, _receiver) = ChatSession::with_config(SessionConfig {
+        compaction: CompactionConfig {
+            protect_recent_turns: 0,
+            ..CompactionConfig::default()
+        },
+        ..SessionConfig::default()
+    });
+    session.push_user("old context");
+
+    let response = session
+        .run_user_message_with_tools(&provider, &registry, "add 2 and 3")
+        .await
+        .unwrap();
+
+    tool_call_mock.assert();
+    final_mock.assert();
+    assert_eq!(response.message.content, "2 + 3 = 5");
+    assert!(session.turns().iter().any(|turn| turn.name.as_deref()
+        == Some(COMPACT_SUMMARIZE_MESSAGES)
+        && turn.content.starts_with("Compaction acknowledged:")));
+    assert!(
+        session
+            .turns()
+            .iter()
+            .any(|turn| turn.name.as_deref() == Some("add") && turn.content == "5")
+    );
+}
+
+#[tokio::test]
 async fn model_payload_telemetry_captures_request_and_response() {
     let server = MockServer::start();
     let mock = server.mock(|when, then| {

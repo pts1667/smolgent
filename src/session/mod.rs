@@ -377,11 +377,6 @@ impl ChatSession {
                 return Ok(response);
             }
 
-            if self.response_has_compaction_calls(&response) {
-                self.execute_compaction_response(response.message.clone())?;
-                continue;
-            }
-
             if completed_tool_rounds >= self.config.max_tool_rounds {
                 self.emit(AgentEvent::MaxToolRoundsReached {
                     max_tool_rounds: self.config.max_tool_rounds,
@@ -399,8 +394,13 @@ impl ChatSession {
             });
             self.push(response.message.clone());
             for call in &response.message.tool_calls {
-                self.execute_tool_call_reporting_errors(registry, call, Some(round))
-                    .await;
+                if is_compaction_tool(&call.function.name) {
+                    let result = self.execute_compaction_tool_call(call);
+                    self.push(result.into_message());
+                } else {
+                    self.execute_tool_call_reporting_errors(registry, call, Some(round))
+                        .await;
+                }
             }
             completed_tool_rounds = round;
         }
@@ -491,15 +491,7 @@ impl ChatSession {
         Ok(response)
     }
 
-    fn response_has_compaction_calls(&self, response: &ChatResponse) -> bool {
-        self.config.compaction.enabled
-            && response
-                .message
-                .tool_calls
-                .iter()
-                .any(|call| is_compaction_tool(&call.function.name))
-    }
-
+    #[cfg(test)]
     fn execute_compaction_response(&mut self, message: ChatMessage) -> Result<()> {
         self.push(message.clone());
         for call in &message.tool_calls {

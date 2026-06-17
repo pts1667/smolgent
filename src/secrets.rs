@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use keyring_core::{CredentialStore, Entry};
 
-use crate::Result;
+use crate::{Error, Result};
 
 pub trait SecretStore: Send + Sync {
     fn set_api_key(&self, provider_id: &str, api_key: &str) -> Result<()>;
@@ -18,7 +18,15 @@ pub struct KeyringCoreSecretStore {
 
 impl KeyringCoreSecretStore {
     pub fn new(service: impl Into<String>) -> Result<Self> {
-        Ok(Self::with_store(service, native_credential_store()?))
+        let service = service.into();
+        match native_credential_store() {
+            Ok(store) => Ok(Self::with_store(service, store)),
+            Err(Error::UnsupportedNativeKeyring(_)) => Ok(Self {
+                service,
+                store: None,
+            }),
+            Err(error) => Err(error),
+        }
     }
 
     // Secret store for the default agent
