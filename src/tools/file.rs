@@ -80,12 +80,14 @@ Examples:
 {"pattern":"TODO","paths":["src","tests"],"fixed_strings":true,"glob":["*.rs"]}"#;
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
+/// Arguments for the built-in `read` tool.
 pub struct ReadArgs {
     /// File path to read. Relative paths are resolved from the current process directory.
     pub path: PathBuf,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
+/// Arguments for the built-in `create_file` tool.
 pub struct CreateFileArgs {
     /// File path to create. Relative paths are resolved from the current process directory.
     pub path: PathBuf,
@@ -100,18 +102,21 @@ pub struct CreateFileArgs {
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
+/// Arguments for the built-in `delete_file` tool.
 pub struct DeleteFileArgs {
     /// File path to delete. The path must refer to an existing file, not a directory.
     pub path: PathBuf,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
+/// Arguments for the built-in `apply_patch` tool.
 pub struct ApplyPatchArgs {
     /// Patch text in the documented begin/end patch format.
     pub patch: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
+/// Arguments for the built-in `ripgrep` tool.
 pub struct RgArgs {
     /// Regex pattern to search for. Optional only when `files` is true.
     pub pattern: Option<String>,
@@ -144,6 +149,7 @@ pub struct RgArgs {
     pub files: bool,
 }
 
+/// Create the built-in `read` tool.
 pub fn read_tool(state: AgentState) -> Tool {
     Tool::new(
         ToolDefinition::new("read", READ_DESCRIPTION, schemars::schema_for!(ReadArgs)),
@@ -157,6 +163,7 @@ pub fn read_tool(state: AgentState) -> Tool {
     )
 }
 
+/// Create the built-in `create_file` tool.
 pub fn create_file_tool(state: AgentState) -> Tool {
     Tool::new(
         ToolDefinition::new(
@@ -174,6 +181,7 @@ pub fn create_file_tool(state: AgentState) -> Tool {
     )
 }
 
+/// Create the built-in `delete_file` tool.
 pub fn delete_file_tool(state: AgentState) -> Tool {
     Tool::new(
         ToolDefinition::new(
@@ -191,6 +199,7 @@ pub fn delete_file_tool(state: AgentState) -> Tool {
     )
 }
 
+/// Create the built-in `apply_patch` tool.
 pub fn apply_patch_tool(state: AgentState) -> Tool {
     Tool::new(
         ToolDefinition::new(
@@ -208,6 +217,7 @@ pub fn apply_patch_tool(state: AgentState) -> Tool {
     )
 }
 
+/// Create the built-in `ripgrep` search tool.
 pub fn ripgrep_tool(state: AgentState) -> Tool {
     Tool::new(
         ToolDefinition::new(
@@ -225,6 +235,9 @@ pub fn ripgrep_tool(state: AgentState) -> Tool {
     )
 }
 
+/// Create the default built-in file-tool registry.
+///
+/// Includes `read`, `create_file`, `delete_file`, `apply_patch`, and `ripgrep`.
 pub fn builtin_registry(state: AgentState) -> crate::ToolRegistry {
     crate::ToolRegistry::new()
         .with_tool(read_tool(state.clone()))

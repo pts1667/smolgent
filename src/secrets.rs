@@ -4,12 +4,26 @@ use keyring_core::{CredentialStore, Entry};
 
 use crate::{Error, Result};
 
+/// Storage backend for provider API keys.
+///
+/// Provider configurations reference keys by provider id. [`ProviderConfig::openrouter`] uses the
+/// id `openrouter`.
+///
+/// [`ProviderConfig::openrouter`]: crate::ProviderConfig::openrouter
 pub trait SecretStore: Send + Sync {
+    /// Store or replace an API key for a provider id.
     fn set_api_key(&self, provider_id: &str, api_key: &str) -> Result<()>;
+    /// Load an API key for a provider id.
     fn get_api_key(&self, provider_id: &str) -> Result<Option<String>>;
+    /// Delete an API key for a provider id.
     fn delete_api_key(&self, provider_id: &str) -> Result<()>;
 }
 
+/// [`SecretStore`] implementation backed by `keyring-core`.
+///
+/// On Windows and Linux, [`KeyringCoreSecretStore::new`] installs the native keyring-core store
+/// used by this crate's optional platform dependencies. On other targets it falls back to
+/// `keyring_core::Entry::new`.
 #[derive(Clone)]
 pub struct KeyringCoreSecretStore {
     service: String,
@@ -17,6 +31,7 @@ pub struct KeyringCoreSecretStore {
 }
 
 impl KeyringCoreSecretStore {
+    /// Create a keyring-backed store for a service name.
     pub fn new(service: impl Into<String>) -> Result<Self> {
         let service = service.into();
         match native_credential_store() {
@@ -29,11 +44,14 @@ impl KeyringCoreSecretStore {
         }
     }
 
-    // Secret store for the default agent
+    /// Secret store for the default `smolgent` service.
     pub fn smolgent() -> Result<Self> {
         Self::new("smolgent")
     }
 
+    /// Create a store from an explicit keyring-core credential store.
+    ///
+    /// This is mainly useful for tests or custom keyring-core backends.
     pub fn with_store(service: impl Into<String>, store: Arc<CredentialStore>) -> Self {
         Self {
             service: service.into(),
@@ -49,6 +67,7 @@ impl KeyringCoreSecretStore {
     }
 }
 
+/// Construct the platform-native keyring-core credential store.
 pub fn native_credential_store() -> Result<Arc<CredentialStore>> {
     native_credential_store_impl()
 }

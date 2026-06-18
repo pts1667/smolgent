@@ -21,6 +21,11 @@ use crate::tools::compact::{
 use crate::tools::{ToolDefinition, ToolRegistry, ToolResult};
 use crate::{Error, Result};
 
+/// One persisted turn in a [`ChatSession`].
+///
+/// This is the session-side representation of a chat message. It keeps provider reasoning payloads
+/// and tool-call metadata intact so the conversation can be replayed to providers that support
+/// preserved reasoning or tool-call continuations.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SessionTurn {
     pub id: u64,
@@ -66,13 +71,25 @@ impl From<SessionTurn> for ChatMessage {
     }
 }
 
+/// Runtime configuration for [`ChatSession`].
+///
+/// Event and telemetry channels are bounded. If `notifications` or `telemetry` are enabled, drain
+/// the returned receivers from [`ChatSession::with_config`],
+/// [`ChatSession::with_config_and_telemetry`], or
+/// [`ChatSession::with_system_prompt_config_and_telemetry`] while the agent is running.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionConfig {
+    /// Maximum normal tool-call rounds before the managed loop stops.
     pub max_tool_rounds: usize,
+    /// Optional capacity for the [`AgentEventReceiver`]. Defaults to `4 * max_tool_rounds`.
     pub event_channel_capacity: Option<usize>,
+    /// Which high-level agent progress events to emit.
     pub notifications: NotificationConfig,
+    /// Context compaction behavior.
     pub compaction: CompactionConfig,
+    /// Which structured telemetry events to emit.
     pub telemetry: TelemetryConfig,
+    /// Optional capacity for the [`TelemetryEventReceiver`]. Defaults to `8 * max_tool_rounds`.
     pub telemetry_channel_capacity: Option<usize>,
 }
 
@@ -90,17 +107,23 @@ impl Default for SessionConfig {
 }
 
 impl SessionConfig {
+    /// Effective bounded channel capacity for [`AgentEvent`] notifications.
     pub fn event_channel_capacity(&self) -> usize {
         self.event_channel_capacity
             .unwrap_or_else(|| self.max_tool_rounds.saturating_mul(4).max(1))
     }
 
+    /// Effective bounded channel capacity for [`TelemetryEvent`] notifications.
     pub fn telemetry_channel_capacity(&self) -> usize {
         self.telemetry_channel_capacity
             .unwrap_or_else(|| self.max_tool_rounds.saturating_mul(8).max(8))
     }
 }
 
+/// Stateful chat transcript and managed agent loop.
+///
+/// A session owns the message history, preserves reasoning/tool-call state, optionally emits
+/// [`AgentEvent`] and [`TelemetryEvent`] values, and can run model/tool loops with a [`ToolRegistry`].
 #[derive(Clone)]
 pub struct ChatSession {
     turns: Vec<SessionTurn>,
@@ -144,21 +167,31 @@ impl PartialEq for ChatSession {
 }
 
 impl ChatSession {
+    /// Create an empty session with default configuration and no event streams.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Create a session seeded with a system prompt.
     pub fn with_system_prompt(prompt: impl Into<String>) -> Self {
         let mut session = Self::new();
         session.push_system(prompt);
         session
     }
 
+    /// Create a configured session and optional [`AgentEventReceiver`].
+    ///
+    /// The receiver is `Some` only when [`SessionConfig::notifications`] enables at least one
+    /// event kind. Drain it while the agent runs; sends block when the bounded channel is full.
     pub fn with_config(config: SessionConfig) -> (Self, Option<AgentEventReceiver>) {
         let (session, events, _telemetry) = Self::with_config_and_telemetry(config);
         (session, events)
     }
 
+    /// Create a configured session plus optional event and telemetry receivers.
+    ///
+    /// The telemetry receiver is `Some` only when [`SessionConfig::telemetry`] enables at least one
+    /// event kind. Drain enabled receivers while the agent runs; both channels are bounded.
     pub fn with_config_and_telemetry(
         config: SessionConfig,
     ) -> (
@@ -192,6 +225,7 @@ impl ChatSession {
         )
     }
 
+    /// Create a configured session seeded with a system prompt.
     pub fn with_system_prompt_and_config(
         prompt: impl Into<String>,
         config: SessionConfig,
@@ -201,6 +235,7 @@ impl ChatSession {
         (session, receiver)
     }
 
+    /// Create a configured session seeded with a system prompt, with event and telemetry receivers.
     pub fn with_system_prompt_config_and_telemetry(
         prompt: impl Into<String>,
         config: SessionConfig,
@@ -214,42 +249,52 @@ impl ChatSession {
         (session, events, telemetry)
     }
 
+    /// Current session configuration.
     pub fn config(&self) -> &SessionConfig {
         &self.config
     }
 
+    /// Mutable session configuration.
     pub fn config_mut(&mut self) -> &mut SessionConfig {
         &mut self.config
     }
 
+    /// Persisted session turns.
     pub fn turns(&self) -> &[SessionTurn] {
         &self.turns
     }
 
+    /// Estimated context usage and largest consumers.
     pub fn context_usage_breakdown(&self) -> ContextUsageBreakdown {
         self.context_usage_breakdown_with_limit(self.turns.len())
     }
 
+    /// Rough token estimate for the active context.
     pub fn estimated_context_tokens(&self) -> usize {
         self.context_usage_breakdown().total_estimated_tokens
     }
 
+    /// Convert the session history into provider chat messages.
     pub fn messages(&self) -> Vec<ChatMessage> {
         self.turns.iter().cloned().map(ChatMessage::from).collect()
     }
 
+    /// Append a system message.
     pub fn push_system(&mut self, content: impl Into<String>) {
         self.push(ChatMessage::system(content));
     }
 
+    /// Append a user message.
     pub fn push_user(&mut self, content: impl Into<String>) {
         self.push(ChatMessage::user(content));
     }
 
+    /// Append a plain assistant message.
     pub fn push_assistant(&mut self, content: impl Into<String>) {
         self.push(ChatMessage::assistant(content));
     }
 
+    /// Append any chat message, preserving reasoning and tool-call fields.
     pub fn push(&mut self, message: ChatMessage) {
         self.push_turn(message.into());
     }
@@ -308,6 +353,7 @@ impl ChatSession {
         compaction::remove_previous_tool_messages(&mut self.turns)
     }
 
+    /// Add a user message, send one provider request without tools, and persist the assistant reply.
     pub async fn send_user_message(
         &mut self,
         provider: &ChatProvider,
@@ -317,6 +363,7 @@ impl ChatSession {
         self.complete(provider).await
     }
 
+    /// Send one provider request using the current session history, without tools.
     pub async fn complete(&mut self, provider: &ChatProvider) -> Result<ChatResponse> {
         let response = self
             .send_provider_request(provider, self.messages(), Vec::new())
@@ -325,6 +372,10 @@ impl ChatSession {
         Ok(response)
     }
 
+    /// Send one provider request with tool definitions but do not execute returned tool calls.
+    ///
+    /// Use [`ChatSession::run_with_tools`] or [`ChatSession::run_user_message_with_tools`] when you
+    /// want the session to execute tools and continue until the model returns a final answer.
     pub async fn complete_with_tools(
         &mut self,
         provider: &ChatProvider,
@@ -337,6 +388,10 @@ impl ChatSession {
         Ok(response)
     }
 
+    /// Add a user message and run the managed tool loop.
+    ///
+    /// This repeatedly sends requests, executes registry and compaction tool calls, records tool
+    /// results, and stops when the model returns an assistant message without tool calls.
     pub async fn run_user_message_with_tools(
         &mut self,
         provider: &ChatProvider,
@@ -347,6 +402,10 @@ impl ChatSession {
         self.run_with_tools(provider, registry).await
     }
 
+    /// Run the managed tool loop from the current session state.
+    ///
+    /// Built-in compaction tools are offered according to [`CompactionConfig`]. Normal tool rounds
+    /// are bounded by [`SessionConfig::max_tool_rounds`].
     pub async fn run_with_tools(
         &mut self,
         provider: &ChatProvider,

@@ -5,6 +5,9 @@ pub use crate::tools::file::{
 
 use crate::state::AgentState;
 
+/// Default built-in registry for filesystem-oriented agents.
+///
+/// Includes read/search tools for readable roots and create/delete/patch tools for writable roots.
 pub fn builtin_registry(state: AgentState) -> crate::ToolRegistry {
     crate::ToolRegistry::new()
         .with_tool(read_tool(state.clone()))

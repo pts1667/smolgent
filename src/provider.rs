@@ -11,32 +11,49 @@ use crate::secrets::SecretStore;
 use crate::tools::ToolDefinition;
 use crate::{Error, Result};
 
+/// Supported provider presets.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProviderKind {
+    /// OpenRouter's OpenAI-compatible chat-completions endpoint.
     OpenRouter,
+    /// A local llama.cpp server exposing `/v1/chat/completions`.
     LlamaCpp,
+    /// Generic OpenAI-compatible endpoint.
     OpenAiCompatible,
 }
 
+/// Where a provider should obtain its API key.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ApiKeyRef {
+    /// No API key is sent.
     None,
+    /// Use the provided literal API key.
     Literal(String),
+    /// Look up an API key by provider id in the configured [`crate::SecretStore`].
     Keyring(String),
 }
 
+/// Configuration for an OpenAI-compatible chat-completions provider.
 #[derive(Clone, Debug)]
 pub struct ProviderConfig {
+    /// Human-readable provider name used in telemetry.
     pub name: String,
+    /// Provider preset.
     pub kind: ProviderKind,
+    /// Full chat-completions URL.
     pub chat_completions_url: Url,
+    /// API-key lookup behavior.
     pub api_key: ApiKeyRef,
+    /// Model used when building requests.
     pub default_model: String,
+    /// Extra HTTP headers to include on every request.
     pub headers: Vec<(String, String)>,
+    /// Optional provider-specific reasoning configuration.
     pub reasoning: Option<ReasoningConfig>,
 }
 
 impl ProviderConfig {
+    /// OpenRouter configuration using a key named `openrouter` in the configured secret store.
     pub fn openrouter(model: impl Into<String>) -> Result<Self> {
         Ok(Self {
             name: "openrouter".to_string(),
@@ -49,6 +66,9 @@ impl ProviderConfig {
         })
     }
 
+    /// llama.cpp server configuration.
+    ///
+    /// The base URL should be the server root, for example `http://127.0.0.1:8080`.
     pub fn llama_cpp(base_url: impl AsRef<str>, model: impl Into<String>) -> Result<Self> {
         let base = Url::parse(base_url.as_ref())?;
         Ok(Self {
@@ -63,6 +83,7 @@ impl ProviderConfig {
     }
 }
 
+/// HTTP client wrapper for sending chat-completions requests.
 #[derive(Clone)]
 pub struct ChatProvider {
     client: reqwest::Client,
@@ -71,6 +92,7 @@ pub struct ChatProvider {
 }
 
 impl ChatProvider {
+    /// Create a provider using the default `reqwest` client.
     pub fn new(config: ProviderConfig) -> Self {
         Self {
             client: reqwest::Client::new(),
@@ -79,24 +101,29 @@ impl ChatProvider {
         }
     }
 
+    /// Replace the HTTP client, useful for custom TLS/proxy settings or tests.
     pub fn with_client(mut self, client: reqwest::Client) -> Self {
         self.client = client;
         self
     }
 
+    /// Attach a secret store for providers configured with [`ApiKeyRef::Keyring`].
     pub fn with_secrets(mut self, secrets: Arc<dyn SecretStore>) -> Self {
         self.secrets = Some(secrets);
         self
     }
 
+    /// Provider configuration.
     pub fn config(&self) -> &ProviderConfig {
         &self.config
     }
 
+    /// Send messages without tools.
     pub async fn send_messages(&self, messages: &[ChatMessage]) -> Result<ChatResponse> {
         self.send_messages_with_tools(messages, Vec::new()).await
     }
 
+    /// Send messages with tool definitions.
     pub async fn send_messages_with_tools(
         &self,
         messages: &[ChatMessage],
@@ -106,6 +133,7 @@ impl ChatProvider {
         self.send_request(request).await
     }
 
+    /// Build a request without sending it.
     pub fn build_request(
         &self,
         messages: &[ChatMessage],
@@ -123,6 +151,7 @@ impl ChatProvider {
         }
     }
 
+    /// Send a pre-built request and parse the response.
     pub async fn send_request(&self, request: ChatRequest) -> Result<ChatResponse> {
         let raw = self
             .client

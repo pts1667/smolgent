@@ -14,16 +14,21 @@ pub mod builtin;
 pub mod compact;
 pub mod file;
 
+/// Async handler result type used by [`Tool`].
 pub type ToolFuture = Pin<Box<dyn Future<Output = Result<Value>> + Send>>;
 
+/// OpenAI-compatible function tool definition.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ToolDefinition {
+    /// Tool type, normally `function`.
     #[serde(rename = "type")]
     pub kind: String,
+    /// Function metadata exposed to the model.
     pub function: FunctionToolDefinition,
 }
 
 impl ToolDefinition {
+    /// Create a function tool definition from a name, description, and JSON schema parameters.
     pub fn new(
         name: impl Into<String>,
         description: impl Into<String>,
@@ -44,18 +49,24 @@ impl ToolDefinition {
         }
     }
 
+    /// Tool function name.
     pub fn name(&self) -> &str {
         &self.function.name
     }
 }
 
+/// Function metadata exposed in a [`ToolDefinition`].
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct FunctionToolDefinition {
+    /// Function name the model must call.
     pub name: String,
+    /// Human-readable tool description.
     pub description: String,
+    /// JSON schema for tool arguments.
     pub parameters: Value,
 }
 
+/// A callable tool with its model-facing definition.
 #[derive(Clone)]
 pub struct Tool {
     definition: ToolDefinition,
@@ -63,6 +74,7 @@ pub struct Tool {
 }
 
 impl Tool {
+    /// Create a tool from a definition and async handler.
     pub fn new<F>(definition: ToolDefinition, handler: F) -> Self
     where
         F: Fn(Value) -> ToolFuture + Send + Sync + 'static,
@@ -73,27 +85,35 @@ impl Tool {
         }
     }
 
+    /// Model-facing definition.
     pub fn definition(&self) -> &ToolDefinition {
         &self.definition
     }
 
+    /// Tool function name.
     pub fn name(&self) -> &str {
         self.definition.name()
     }
 
+    /// Call the tool handler with decoded JSON arguments.
     pub async fn call(&self, arguments: Value) -> Result<Value> {
         (self.handler)(arguments).await
     }
 }
 
+/// Result of executing a tool call.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ToolResult {
+    /// Provider tool-call id this result answers.
     pub tool_call_id: String,
+    /// Tool name.
     pub name: String,
+    /// Tool output sent back to the model.
     pub content: String,
 }
 
 impl ToolResult {
+    /// Convert an execution error into a tool result the model can correct.
     pub fn error(call: &ToolCall, error: impl fmt::Display) -> Self {
         Self {
             tool_call_id: call.id.clone(),
@@ -104,6 +124,7 @@ impl ToolResult {
         }
     }
 
+    /// Convert this result into a chat message with role `tool`.
     pub fn into_message(self) -> ChatMessage {
         ChatMessage {
             role: MessageRole::Tool,
@@ -118,29 +139,35 @@ impl ToolResult {
     }
 }
 
+/// Storage and dispatcher for tools available to an agent.
 #[derive(Clone, Default)]
 pub struct ToolRegistry {
     tools: HashMap<String, Tool>,
 }
 
 impl ToolRegistry {
+    /// Create an empty registry.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Insert or replace a tool by name.
     pub fn insert(&mut self, tool: Tool) -> Option<Tool> {
         self.tools.insert(tool.name().to_string(), tool)
     }
 
+    /// Builder-style insertion.
     pub fn with_tool(mut self, tool: Tool) -> Self {
         self.insert(tool);
         self
     }
 
+    /// Look up a tool by name.
     pub fn get(&self, name: &str) -> Option<&Tool> {
         self.tools.get(name)
     }
 
+    /// Definitions to send to a model.
     pub fn definitions(&self) -> Vec<ToolDefinition> {
         self.tools
             .values()
@@ -148,6 +175,7 @@ impl ToolRegistry {
             .collect()
     }
 
+    /// Execute one provider tool call, returning an error if the tool or arguments are invalid.
     pub async fn execute_call(&self, call: &ToolCall) -> Result<ToolResult> {
         let tool = self
             .get(&call.function.name)
@@ -162,6 +190,7 @@ impl ToolRegistry {
         })
     }
 
+    /// Execute one provider tool call and convert any error into a model-visible tool result.
     pub async fn execute_call_reporting_errors(&self, call: &ToolCall) -> ToolResult {
         match self.execute_call(call).await {
             Ok(result) => result,
@@ -169,6 +198,7 @@ impl ToolRegistry {
         }
     }
 
+    /// Execute multiple tool calls, stopping on the first error.
     pub async fn execute_calls(&self, calls: &[ToolCall]) -> Result<Vec<ToolResult>> {
         let mut results = Vec::with_capacity(calls.len());
         for call in calls {
@@ -177,6 +207,7 @@ impl ToolRegistry {
         Ok(results)
     }
 
+    /// Execute multiple tool calls and report each error as a tool result.
     pub async fn execute_calls_reporting_errors(&self, calls: &[ToolCall]) -> Vec<ToolResult> {
         let mut results = Vec::with_capacity(calls.len());
         for call in calls {

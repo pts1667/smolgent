@@ -1,5 +1,9 @@
 use std::path::{Component, Path, PathBuf};
 
+/// Allowed filesystem roots for built-in tools.
+///
+/// Read roots allow `read` and `ripgrep`. Write roots allow `create_file`, `delete_file`, and
+/// `apply_patch`, and are automatically treated as read roots as well.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct AgentState {
     read_roots: Vec<PathBuf>,
@@ -7,6 +11,10 @@ pub struct AgentState {
 }
 
 impl AgentState {
+    /// Create state from allowed read and write roots.
+    ///
+    /// Paths are normalized up front. Missing descendants are allowed as long as their nearest
+    /// existing ancestor is under an allowed root.
     pub fn new(
         read_roots: impl IntoIterator<Item = PathBuf>,
         write_roots: impl IntoIterator<Item = PathBuf>,
@@ -24,26 +32,32 @@ impl AgentState {
         }
     }
 
+    /// Normalized read roots.
     pub fn read_roots(&self) -> &[PathBuf] {
         &self.read_roots
     }
 
+    /// Normalized write roots.
     pub fn write_roots(&self) -> &[PathBuf] {
         &self.write_roots
     }
 
+    /// Whether a path is under an allowed read root.
     pub fn can_read(&self, path: impl AsRef<Path>) -> bool {
         self.readable_path(path).is_some()
     }
 
+    /// Whether a path is under an allowed write root.
     pub fn can_write(&self, path: impl AsRef<Path>) -> bool {
         self.writable_path(path).is_some()
     }
 
+    /// Return the normalized path if it is readable.
     pub fn readable_path(&self, path: impl AsRef<Path>) -> Option<PathBuf> {
         path_under_any_root(path.as_ref(), &self.read_roots)
     }
 
+    /// Return the normalized path if it is writable.
     pub fn writable_path(&self, path: impl AsRef<Path>) -> Option<PathBuf> {
         path_under_any_root(path.as_ref(), &self.write_roots)
     }

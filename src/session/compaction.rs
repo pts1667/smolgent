@@ -5,14 +5,26 @@ use crate::session::SessionTurn;
 use crate::tools::compact::is_compaction_tool;
 use crate::{Error, Result};
 
+/// Configuration for context compaction.
+///
+/// When enabled, the managed tool loop can ask the model to remove or summarize older turns using
+/// built-in compaction tools. Explicit compaction is triggered before a normal model request when
+/// the estimated token count reaches [`CompactionConfig::trigger_estimated_tokens`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompactionConfig {
+    /// Whether compaction tools and trigger checks are enabled.
     pub enabled: bool,
+    /// Estimated token count at which explicit compaction is requested.
     pub trigger_estimated_tokens: usize,
+    /// Target estimated token count after compaction.
     pub target_estimated_tokens: usize,
+    /// Maximum explicit compaction rounds per trigger.
     pub max_compaction_rounds: usize,
+    /// Offer compaction tools during normal tool rounds, not only explicit compaction.
     pub always_offer_tools: bool,
+    /// Number of most recent turns protected from compaction.
     pub protect_recent_turns: usize,
+    /// Number of largest turns/tool calls included in explicit compaction breakdowns.
     pub top_consumers: usize,
 }
 
@@ -31,6 +43,7 @@ impl Default for CompactionConfig {
 }
 
 impl CompactionConfig {
+    /// Disable context compaction.
     pub fn disabled() -> Self {
         Self {
             enabled: false,
@@ -39,32 +52,52 @@ impl CompactionConfig {
     }
 }
 
+/// Estimated usage for one session turn.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContextUsage {
+    /// Session turn id.
     pub turn_id: u64,
+    /// Chat role.
     pub role: MessageRole,
+    /// Optional tool/function name.
     pub name: Option<String>,
+    /// Approximate byte count.
     pub bytes: usize,
+    /// Rough token estimate.
     pub estimated_tokens: usize,
+    /// Short preview for diagnostics.
     pub summary: String,
 }
 
+/// Estimated usage for one tool call and its associated result turns.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ToolCallUsage {
+    /// Tool-call id from the provider.
     pub tool_call_id: String,
+    /// Tool name.
     pub name: String,
+    /// Turn id containing the tool-call request.
     pub request_turn_id: u64,
+    /// Turn ids containing matching tool results.
     pub result_turn_ids: Vec<u64>,
+    /// Approximate byte count.
     pub bytes: usize,
+    /// Rough token estimate.
     pub estimated_tokens: usize,
+    /// Short preview of tool arguments.
     pub arguments_preview: String,
 }
 
+/// Estimated total context usage and largest consumers.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ContextUsageBreakdown {
+    /// Approximate byte count for all active turns.
     pub total_bytes: usize,
+    /// Rough token estimate for all active turns.
     pub total_estimated_tokens: usize,
+    /// Largest individual turns, sorted descending by estimated tokens.
     pub largest_turns: Vec<ContextUsage>,
+    /// Largest tool-call request/result groups, sorted descending by estimated tokens.
     pub largest_tool_calls: Vec<ToolCallUsage>,
 }
 
