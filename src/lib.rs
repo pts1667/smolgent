@@ -15,6 +15,8 @@
 //! Store your OpenRouter key once:
 //!
 //! ```text
+//! # optional: choose an app-specific key id
+//! set SMOLGENT_OPENROUTER_KEY_ID=my-app/openrouter
 //! cargo run --example openrouter_keyring_setup -- set <OPENROUTER_API_KEY>
 //! ```
 //!
@@ -29,9 +31,13 @@
 //!
 //! #[tokio::main]
 //! async fn main() -> smolgent::Result<()> {
+//!     let keyring_id = "my-app/openrouter";
 //!     let secrets = Arc::new(KeyringCoreSecretStore::smolgent()?);
 //!     let provider = ChatProvider::new(
-//!         ProviderConfig::openrouter("deepseek/deepseek-v4-flash")?,
+//!         ProviderConfig::openrouter_with_keyring(
+//!             "deepseek/deepseek-v4-flash",
+//!             keyring_id,
+//!         )?,
 //!     )
 //!     .with_secrets(secrets);
 //!

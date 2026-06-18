@@ -20,7 +20,17 @@ Replace `.` with any directory you wish to read from.
 ## Providing API Keys
 
 Providing API keys should be done using keyring secrets.
-It is the user's responsibility to provide these to the library, or preferably store them in the keyring themselves, in a secure fashion.
+It is the app's responsibility to choose the keyring id it wants to use. Do not assume a single global OpenRouter key is appropriate for every app using this library.
+Use `ProviderConfig::openrouter_with_keyring(model, "my-app/openrouter")` and store the key under the same id.
+
+The examples use `SMOLGENT_OPENROUTER_KEY_ID`, defaulting to `smolgent/examples/openrouter`:
+
+```powershell
+$env:SMOLGENT_OPENROUTER_KEY_ID = "my-app/openrouter"
+cargo run --example openrouter_keyring_setup -- set-from-env
+cargo run --example openrouter_chat
+```
+
 You can always just use a .env file or even environment variables if you don't care about any of that.
 
 ## Supported Endpoints

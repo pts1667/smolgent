@@ -53,13 +53,26 @@ pub struct ProviderConfig {
 }
 
 impl ProviderConfig {
-    /// OpenRouter configuration using a key named `openrouter` in the configured secret store.
+    /// OpenRouter configuration using a compatibility key id named `openrouter`.
+    ///
+    /// Apps should usually prefer [`ProviderConfig::openrouter_with_keyring`] so each application
+    /// can choose its own keyring id instead of sharing one universal OpenRouter key.
     pub fn openrouter(model: impl Into<String>) -> Result<Self> {
+        Self::openrouter_with_keyring(model, "openrouter")
+    }
+
+    /// OpenRouter configuration using an app-provided keyring id.
+    ///
+    /// The same id must be used when storing the key through [`crate::SecretStore::set_api_key`].
+    pub fn openrouter_with_keyring(
+        model: impl Into<String>,
+        keyring_id: impl Into<String>,
+    ) -> Result<Self> {
         Ok(Self {
             name: "openrouter".to_string(),
             kind: ProviderKind::OpenRouter,
             chat_completions_url: Url::parse("https://openrouter.ai/api/v1/chat/completions")?,
-            api_key: ApiKeyRef::Keyring("openrouter".to_string()),
+            api_key: ApiKeyRef::Keyring(keyring_id.into()),
             default_model: model.into(),
             headers: Vec::new(),
             reasoning: Some(ReasoningConfig::openrouter_enabled()),
@@ -259,9 +272,13 @@ mod tests {
 
         let keyring: Arc<CredentialStore> = keyring_core::mock::Store::new().unwrap();
         let secrets = Arc::new(KeyringCoreSecretStore::with_store("smolgent-test", keyring));
-        secrets.set_api_key("openrouter", "sk-test").unwrap();
+        secrets
+            .set_api_key("test-app/openrouter", "sk-test")
+            .unwrap();
 
-        let mut config = ProviderConfig::openrouter("openai/gpt-oss-20b").unwrap();
+        let mut config =
+            ProviderConfig::openrouter_with_keyring("openai/gpt-oss-20b", "test-app/openrouter")
+                .unwrap();
         config.chat_completions_url =
             Url::parse(&format!("{}/api/v1/chat/completions", server.base_url())).unwrap();
 

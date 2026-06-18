@@ -6,10 +6,11 @@ use crate::{Error, Result};
 
 /// Storage backend for provider API keys.
 ///
-/// Provider configurations reference keys by provider id. [`ProviderConfig::openrouter`] uses the
-/// id `openrouter`.
+/// Provider configurations reference keys by provider id. Apps should choose their own ids, such
+/// as `my-app/openrouter`, and pass the same id to
+/// [`ProviderConfig::openrouter_with_keyring`].
 ///
-/// [`ProviderConfig::openrouter`]: crate::ProviderConfig::openrouter
+/// [`ProviderConfig::openrouter_with_keyring`]: crate::ProviderConfig::openrouter_with_keyring
 pub trait SecretStore: Send + Sync {
     /// Store or replace an API key for a provider id.
     fn set_api_key(&self, provider_id: &str, api_key: &str) -> Result<()>;
