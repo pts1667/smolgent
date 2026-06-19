@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -11,11 +12,23 @@ use crate::{Error, Result};
 
 const READ_DESCRIPTION: &str = r#"Read a UTF-8 text file from an allowed read root.
 
+Output limits:
+- At most 100 lines or 10,000 characters are returned, whichever is reached first.
+- character-offset: optional zero-based Unicode character offset, applied after line-offset.
+- line-offset: optional zero-based number of complete lines to skip first.
+- character-count: optional requested character count, clamped to 10,000.
+- line-count: optional requested line count, clamped to 100.
+- A truncation notice is appended when additional file content exists. Continue with offsets or use ripgrep to locate a targeted passage.
+
 Required parameters:
 - path: file path to read. Relative paths are resolved from the current process directory.
 
 Example:
 {"path":"src/lib.rs"}"#;
+
+const READ_MAX_LINES: usize = 100;
+const READ_MAX_CHARS: usize = 10_000;
+const READ_TRUNCATION_NOTICE: &str = "\n\n[Read truncated: more content is available. Continue with line-offset or character-offset; each read is capped at 100 lines or 10,000 characters.]";
 
 const CREATE_FILE_DESCRIPTION: &str = r#"Create a UTF-8 text file under an allowed write root.
 
@@ -84,6 +97,18 @@ Examples:
 pub struct ReadArgs {
     /// File path to read. Relative paths are resolved from the current process directory.
     pub path: PathBuf,
+    /// Zero-based Unicode character offset applied after line-offset.
+    #[serde(default, rename = "character-offset")]
+    pub character_offset: Option<usize>,
+    /// Zero-based number of complete lines to skip before character-offset.
+    #[serde(default, rename = "line-offset")]
+    pub line_offset: Option<usize>,
+    /// Requested character count. Values above 10,000 are clamped.
+    #[serde(default, rename = "character-count")]
+    pub character_count: Option<usize>,
+    /// Requested line count. Values above 100 are clamped.
+    #[serde(default, rename = "line-count")]
+    pub line_count: Option<usize>,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
@@ -249,7 +274,85 @@ pub fn builtin_registry(state: AgentState) -> crate::ToolRegistry {
 
 fn read(state: &AgentState, args: ReadArgs) -> Result<String> {
     let path = ensure_can_read(state, &args.path)?;
-    Ok(std::fs::read_to_string(tool_path(&path))?)
+    let fs_path = tool_path(&path);
+    if fs_path.is_dir() {
+        return Err(Error::Tool(format!(
+            "read only accepts UTF-8 files, not directories: {}. Use ripgrep with files=true to list files.",
+            display_path(&path)
+        )));
+    }
+    let file = std::fs::File::open(fs_path)?;
+    let mut reader = BufReader::new(file);
+    let requested_lines = args.line_count.unwrap_or(READ_MAX_LINES);
+    let requested_chars = args.character_count.unwrap_or(READ_MAX_CHARS);
+    if requested_lines == 0 || requested_chars == 0 {
+        return Err(Error::Tool(
+            "line-count and character-count must be positive when provided".to_string(),
+        ));
+    }
+    let max_lines = requested_lines.min(READ_MAX_LINES);
+    let max_chars = requested_chars.min(READ_MAX_CHARS);
+
+    for _ in 0..args.line_offset.unwrap_or(0) {
+        let mut discarded = String::new();
+        if reader.read_line(&mut discarded)? == 0 {
+            return Ok(String::new());
+        }
+    }
+
+    let mut pending = String::new();
+    let mut characters_to_skip = args.character_offset.unwrap_or(0);
+    while characters_to_skip > 0 {
+        let mut line = String::new();
+        if reader.read_line(&mut line)? == 0 {
+            return Ok(String::new());
+        }
+        let line_chars = line.chars().count();
+        if characters_to_skip >= line_chars {
+            characters_to_skip -= line_chars;
+        } else {
+            pending.extend(line.chars().skip(characters_to_skip));
+            characters_to_skip = 0;
+        }
+    }
+
+    let mut output = String::new();
+    let mut line_count = 0;
+    let mut char_count = 0;
+    let mut truncated = false;
+
+    while line_count < max_lines && char_count < max_chars {
+        let line = if pending.is_empty() {
+            let mut line = String::new();
+            if reader.read_line(&mut line)? == 0 {
+                break;
+            }
+            line
+        } else {
+            std::mem::take(&mut pending)
+        };
+        if line.is_empty() {
+            break;
+        }
+        let remaining = max_chars - char_count;
+        let line_chars = line.chars().count();
+        if line_chars > remaining {
+            output.extend(line.chars().take(remaining));
+            truncated = true;
+            break;
+        }
+        output.push_str(&line);
+        char_count += line_chars;
+        line_count += 1;
+    }
+
+    if !truncated && (line_count == max_lines || char_count == max_chars) {
+        truncated = !pending.is_empty() || !reader.fill_buf()?.is_empty();
+    }
+    if truncated {
+        output.push_str(READ_TRUNCATION_NOTICE);
+    }
+    Ok(output)
 }
 
 fn create_file(state: &AgentState, args: CreateFileArgs) -> Result<String> {
@@ -343,10 +446,27 @@ fn ripgrep(state: &AgentState, args: RgArgs) -> Result<String> {
     let stdout = sanitize_tool_output(&String::from_utf8_lossy(&output.stdout));
     let stderr = sanitize_tool_output(&String::from_utf8_lossy(&output.stderr));
     if output.status.success() {
-        return Ok(stdout);
+        return Ok(if stdout.trim().is_empty() {
+            if args.files {
+                "No files found under the requested paths.".to_string()
+            } else {
+                "No matches found.".to_string()
+            }
+        } else {
+            stdout
+        });
     }
     if output.status.code() == Some(1) {
-        return Ok(format!("{stdout}{stderr}"));
+        let combined = format!("{stdout}{stderr}");
+        return Ok(if combined.trim().is_empty() {
+            if args.files {
+                "No files found under the requested paths.".to_string()
+            } else {
+                "No matches found.".to_string()
+            }
+        } else {
+            combined
+        });
     }
     Err(Error::Tool(format!(
         "ripgrep failed with status {}: {}",
@@ -752,6 +872,176 @@ mod tests {
                 .await
                 .is_err()
         );
+        let directory_error = registry
+            .get("read")
+            .unwrap()
+            .call(json!({ "path": file.parent().unwrap() }))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(directory_error.contains("not directories"));
+    }
+
+    #[tokio::test]
+    async fn read_tool_caps_lines_and_reports_truncation() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("long.txt");
+        let content = (1..=101)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        std::fs::write(&file, content).unwrap();
+        let registry =
+            ToolRegistry::new().with_tool(read_tool(AgentState::new([temp.path().into()], [])));
+
+        let output = registry
+            .get("read")
+            .unwrap()
+            .call(json!({"path": file}))
+            .await
+            .unwrap();
+        let output = output.as_str().unwrap();
+        assert!(output.contains("line 100\n"));
+        assert!(!output.contains("line 101\n"));
+        assert!(output.contains("[Read truncated:"));
+    }
+
+    #[tokio::test]
+    async fn read_tool_caps_unicode_characters_not_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("characters.txt");
+        std::fs::write(&file, "é".repeat(READ_MAX_CHARS + 1)).unwrap();
+        let registry =
+            ToolRegistry::new().with_tool(read_tool(AgentState::new([temp.path().into()], [])));
+
+        let output = registry
+            .get("read")
+            .unwrap()
+            .call(json!({"path": file}))
+            .await
+            .unwrap();
+        let output = output.as_str().unwrap();
+        let content = output.split(READ_TRUNCATION_NOTICE).next().unwrap();
+        assert_eq!(content.chars().count(), READ_MAX_CHARS);
+        assert!(output.ends_with(READ_TRUNCATION_NOTICE));
+    }
+
+    #[tokio::test]
+    async fn read_tool_does_not_mark_exact_limit_at_eof_as_truncated() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("exact.txt");
+        std::fs::write(&file, "x".repeat(READ_MAX_CHARS)).unwrap();
+        let registry =
+            ToolRegistry::new().with_tool(read_tool(AgentState::new([temp.path().into()], [])));
+
+        let output = registry
+            .get("read")
+            .unwrap()
+            .call(json!({"path": file}))
+            .await
+            .unwrap();
+        let output = output.as_str().unwrap();
+        assert_eq!(output.chars().count(), READ_MAX_CHARS);
+        assert!(!output.contains("[Read truncated:"));
+    }
+
+    #[tokio::test]
+    async fn read_tool_applies_line_offset_and_count() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("lines.txt");
+        std::fs::write(&file, "zero\none\ntwo\nthree\n").unwrap();
+        let registry =
+            ToolRegistry::new().with_tool(read_tool(AgentState::new([temp.path().into()], [])));
+
+        let output = registry
+            .get("read")
+            .unwrap()
+            .call(json!({
+                "path": file,
+                "line-offset": 1,
+                "line-count": 2
+            }))
+            .await
+            .unwrap();
+        let output = output.as_str().unwrap();
+        assert!(output.starts_with("one\ntwo\n"));
+        assert!(output.ends_with(READ_TRUNCATION_NOTICE));
+    }
+
+    #[tokio::test]
+    async fn read_tool_applies_unicode_character_offset_and_count() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("characters.txt");
+        std::fs::write(&file, "aé日bc").unwrap();
+        let registry =
+            ToolRegistry::new().with_tool(read_tool(AgentState::new([temp.path().into()], [])));
+
+        let output = registry
+            .get("read")
+            .unwrap()
+            .call(json!({
+                "path": file,
+                "character-offset": 1,
+                "character-count": 3
+            }))
+            .await
+            .unwrap();
+        let output = output.as_str().unwrap();
+        assert!(output.starts_with("é日b"));
+        assert!(output.ends_with(READ_TRUNCATION_NOTICE));
+    }
+
+    #[tokio::test]
+    async fn read_tool_composes_line_then_character_offsets() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("combined.txt");
+        std::fs::write(&file, "skip\néclair\nlast\n").unwrap();
+        let registry =
+            ToolRegistry::new().with_tool(read_tool(AgentState::new([temp.path().into()], [])));
+
+        let output = registry
+            .get("read")
+            .unwrap()
+            .call(json!({
+                "path": file,
+                "line-offset": 1,
+                "character-offset": 1,
+                "line-count": 1
+            }))
+            .await
+            .unwrap();
+        let output = output.as_str().unwrap();
+        assert!(output.starts_with("clair\n"));
+        assert!(output.ends_with(READ_TRUNCATION_NOTICE));
+    }
+
+    #[test]
+    fn read_tool_schema_uses_hyphenated_pagination_parameters() {
+        let definition = read_tool(AgentState::default()).definition().clone();
+        let properties = definition.function.parameters["properties"]
+            .as_object()
+            .unwrap();
+        for name in [
+            "character-offset",
+            "line-offset",
+            "character-count",
+            "line-count",
+        ] {
+            assert!(properties.contains_key(name), "missing {name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn ripgrep_file_listing_describes_an_empty_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry =
+            ToolRegistry::new().with_tool(ripgrep_tool(AgentState::new([temp.path().into()], [])));
+        let output = registry
+            .get("ripgrep")
+            .unwrap()
+            .call(json!({"files": true, "paths": [temp.path()]}))
+            .await
+            .unwrap();
+        assert_eq!(output, json!("No files found under the requested paths."));
     }
 
     #[tokio::test]

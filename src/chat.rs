@@ -212,9 +212,13 @@ pub(crate) struct AssistantWireMessage {
 
 impl AssistantWireMessage {
     pub fn into_chat_message(self) -> ChatMessage {
+        let mut content = self.content.unwrap_or_default();
+        if !self.tool_calls.is_empty() && contains_leaked_tool_markup(&content) {
+            content.clear();
+        }
         ChatMessage {
             role: MessageRole::Assistant,
-            content: self.content.unwrap_or_default(),
+            content,
             reasoning: self.reasoning,
             reasoning_content: self.reasoning_content,
             reasoning_details: self.reasoning_details,
@@ -222,5 +226,52 @@ impl AssistantWireMessage {
             tool_call_id: None,
             name: None,
         }
+    }
+}
+
+fn contains_leaked_tool_markup(content: &str) -> bool {
+    content.contains("DSML") && (content.contains("tool_calls") || content.contains("invoke"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn structured_tool_calls_discard_leaked_dsml_content() {
+        let message = AssistantWireMessage {
+            content: Some(
+                "Let me check. <｜DSML｜tool_calls><｜DSML｜invoke name=\"read\">".into(),
+            ),
+            reasoning: None,
+            reasoning_content: None,
+            reasoning_details: None,
+            tool_calls: vec![ToolCall {
+                id: "call_1".into(),
+                kind: "function".into(),
+                function: ToolCallFunction {
+                    name: "read".into(),
+                    arguments: r#"{"path":"notes.txt"}"#.into(),
+                },
+            }],
+        }
+        .into_chat_message();
+
+        assert!(message.content.is_empty());
+        assert_eq!(message.tool_calls.len(), 1);
+    }
+
+    #[test]
+    fn ordinary_tool_call_preambles_are_preserved() {
+        let message = AssistantWireMessage {
+            content: Some("Let me check that file.".into()),
+            reasoning: None,
+            reasoning_content: None,
+            reasoning_details: None,
+            tool_calls: vec![ToolCall::default()],
+        }
+        .into_chat_message();
+
+        assert_eq!(message.content, "Let me check that file.");
     }
 }
