@@ -7,7 +7,6 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::state::AgentState;
-use crate::tools::{Tool, ToolDefinition};
 use crate::{Error, Result};
 
 const READ_DESCRIPTION: &str = r#"Read a UTF-8 text file from an allowed read root.
@@ -174,92 +173,6 @@ pub struct RgArgs {
     pub files: bool,
 }
 
-/// Create the built-in `read` tool.
-pub fn read_tool(state: AgentState) -> Tool {
-    Tool::new(
-        ToolDefinition::new("read", READ_DESCRIPTION, schemars::schema_for!(ReadArgs)),
-        move |arguments| {
-            let state = state.clone();
-            Box::pin(async move {
-                let args: ReadArgs = serde_json::from_value(arguments)?;
-                read(&state, args).map(serde_json::Value::String)
-            })
-        },
-    )
-}
-
-/// Create the built-in `create_file` tool.
-pub fn create_file_tool(state: AgentState) -> Tool {
-    Tool::new(
-        ToolDefinition::new(
-            "create_file",
-            CREATE_FILE_DESCRIPTION,
-            schemars::schema_for!(CreateFileArgs),
-        ),
-        move |arguments| {
-            let state = state.clone();
-            Box::pin(async move {
-                let args: CreateFileArgs = serde_json::from_value(arguments)?;
-                create_file(&state, args).map(serde_json::Value::String)
-            })
-        },
-    )
-}
-
-/// Create the built-in `delete_file` tool.
-pub fn delete_file_tool(state: AgentState) -> Tool {
-    Tool::new(
-        ToolDefinition::new(
-            "delete_file",
-            DELETE_FILE_DESCRIPTION,
-            schemars::schema_for!(DeleteFileArgs),
-        ),
-        move |arguments| {
-            let state = state.clone();
-            Box::pin(async move {
-                let args: DeleteFileArgs = serde_json::from_value(arguments)?;
-                delete_file(&state, args).map(serde_json::Value::String)
-            })
-        },
-    )
-}
-
-/// Create the built-in `apply_patch` tool.
-pub fn apply_patch_tool(state: AgentState) -> Tool {
-    Tool::new(
-        ToolDefinition::new(
-            "apply_patch",
-            APPLY_PATCH_DESCRIPTION,
-            schemars::schema_for!(ApplyPatchArgs),
-        ),
-        move |arguments| {
-            let state = state.clone();
-            Box::pin(async move {
-                let args: ApplyPatchArgs = serde_json::from_value(arguments)?;
-                apply_patch(&state, args).map(serde_json::Value::String)
-            })
-        },
-    )
-}
-
-/// Create the built-in `ripgrep` search tool.
-pub fn ripgrep_tool(state: AgentState) -> Tool {
-    Tool::new(
-        ToolDefinition::new(
-            "ripgrep",
-            RIPGREP_DESCRIPTION,
-            schemars::schema_for!(RgArgs),
-        ),
-        move |arguments| {
-            let state = state.clone();
-            Box::pin(async move {
-                let args: RgArgs = serde_json::from_value(arguments)?;
-                ripgrep(&state, args).map(serde_json::Value::String)
-            })
-        },
-    )
-}
-
 /// Create the default built-in file-tool registry.
 ///
 /// Includes `read`, `create_file`, `delete_file`, `apply_patch`, and `ripgrep`.
@@ -272,7 +185,12 @@ pub fn builtin_registry(state: AgentState) -> crate::ToolRegistry {
         .with_tool(ripgrep_tool(state))
 }
 
-fn read(state: &AgentState, args: ReadArgs) -> Result<String> {
+#[smolgent::tool(
+    description = READ_DESCRIPTION,
+    fallible,
+    factory_visibility = "pub"
+)]
+fn read(#[tool(context)] state: &AgentState, #[tool(arguments)] args: ReadArgs) -> Result<String> {
     let path = ensure_can_read(state, &args.path)?;
     let fs_path = tool_path(&path);
     if fs_path.is_dir() {
@@ -355,7 +273,15 @@ fn read(state: &AgentState, args: ReadArgs) -> Result<String> {
     Ok(output)
 }
 
-fn create_file(state: &AgentState, args: CreateFileArgs) -> Result<String> {
+#[smolgent::tool(
+    description = CREATE_FILE_DESCRIPTION,
+    fallible,
+    factory_visibility = "pub"
+)]
+fn create_file(
+    #[tool(context)] state: &AgentState,
+    #[tool(arguments)] args: CreateFileArgs,
+) -> Result<String> {
     let path = ensure_can_write(state, &args.path)?;
     let fs_path = tool_path(&path);
     if fs_path.try_exists()? && !args.overwrite {
@@ -373,7 +299,15 @@ fn create_file(state: &AgentState, args: CreateFileArgs) -> Result<String> {
     Ok(format!("created {}", display_path(&path)))
 }
 
-fn delete_file(state: &AgentState, args: DeleteFileArgs) -> Result<String> {
+#[smolgent::tool(
+    description = DELETE_FILE_DESCRIPTION,
+    fallible,
+    factory_visibility = "pub"
+)]
+fn delete_file(
+    #[tool(context)] state: &AgentState,
+    #[tool(arguments)] args: DeleteFileArgs,
+) -> Result<String> {
     let path = ensure_can_write(state, &args.path)?;
     let fs_path = tool_path(&path);
     if !fs_path.try_exists()? {
@@ -392,7 +326,12 @@ fn delete_file(state: &AgentState, args: DeleteFileArgs) -> Result<String> {
     Ok(format!("deleted {}", display_path(&path)))
 }
 
-fn ripgrep(state: &AgentState, args: RgArgs) -> Result<String> {
+#[smolgent::tool(
+    description = RIPGREP_DESCRIPTION,
+    fallible,
+    factory_visibility = "pub"
+)]
+fn ripgrep(#[tool(context)] state: &AgentState, #[tool(arguments)] args: RgArgs) -> Result<String> {
     if args.paths.is_empty() {
         return Err(Error::Tool(
             "ripgrep requires at least one path under an allowed read root".to_string(),
@@ -474,7 +413,15 @@ fn ripgrep(state: &AgentState, args: RgArgs) -> Result<String> {
     )))
 }
 
-fn apply_patch(state: &AgentState, args: ApplyPatchArgs) -> Result<String> {
+#[smolgent::tool(
+    description = APPLY_PATCH_DESCRIPTION,
+    fallible,
+    factory_visibility = "pub"
+)]
+fn apply_patch(
+    #[tool(context)] state: &AgentState,
+    #[tool(arguments)] args: ApplyPatchArgs,
+) -> Result<String> {
     let operations = parse_patch(&args.patch)?;
     if operations.is_empty() {
         return Err(Error::Tool("patch contained no operations".to_string()));
@@ -1020,6 +967,10 @@ mod tests {
         let properties = definition.function.parameters["properties"]
             .as_object()
             .unwrap();
+        assert_eq!(
+            properties["path"]["description"],
+            "File path to read. Relative paths are resolved from the current process directory."
+        );
         for name in [
             "character-offset",
             "line-offset",

@@ -105,6 +105,41 @@
 //! # drop(session);
 //! ```
 //!
+//! ## Defining Tools
+//!
+//! For simple functions, [`tool`] derives a JSON Schema from the named parameters. For handlers
+//! with application state or an existing argument type, mark those parameters explicitly:
+//!
+//! ```
+//! use schemars::JsonSchema;
+//! use serde::Deserialize;
+//!
+//! #[derive(Clone)]
+//! struct Counter(i64);
+//!
+//! #[derive(Deserialize, JsonSchema)]
+//! struct AddArgs {
+//!     /// Amount to add to the counter.
+//!     amount: i64,
+//! }
+//!
+//! #[smolgent::tool(fallible)]
+//! fn add(
+//!     #[tool(context)] counter: &Counter,
+//!     #[tool(arguments)] args: AddArgs,
+//! ) -> smolgent::Result<i64> {
+//!     Ok(counter.0 + args.amount)
+//! }
+//!
+//! let tool = add_tool(Counter(10));
+//! assert_eq!(tool.definition().function.name, "add");
+//! ```
+//!
+//! The argument type's Rustdoc and `schemars`/`serde` attributes are retained in the generated
+//! schema. Each expansion also generates `<handler>_tool_definition()` for callers that only need
+//! provider metadata. [`tool_definition`] provides the definition-only form used by tools whose
+//! execution is managed separately.
+//!
 //! ## Examples
 //!
 //! - `cargo run --example openrouter_keyring_setup -- check`
@@ -150,4 +185,4 @@ pub use tools::builtin::{
 };
 pub use tools::{FunctionToolDefinition, Tool, ToolDefinition, ToolRegistry, ToolResult};
 
-pub use smolgent_macros::tool;
+pub use smolgent_macros::{tool, tool_definition};
