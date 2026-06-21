@@ -253,7 +253,10 @@ fn agent_event_status(event: &AgentEvent) -> String {
         }
         AgentEvent::ToolCallStarted {
             name, arguments, ..
-        } => tool_call_status(name, arguments),
+        } => arguments
+            .as_deref()
+            .map(|arguments| tool_call_status(name, arguments))
+            .unwrap_or_else(|| format!("calling {name}")),
         AgentEvent::ToolCallFinished {
             name, content_len, ..
         } => {
@@ -280,9 +283,10 @@ fn agent_event_status(event: &AgentEvent) -> String {
         ),
         AgentEvent::CompactionToolCallStarted {
             name, arguments, ..
-        } => {
-            format!("running {name}: {}", compact_status_args(arguments))
-        }
+        } => arguments
+            .as_deref()
+            .map(|arguments| format!("running {name}: {}", compact_status_args(arguments)))
+            .unwrap_or_else(|| format!("running {name}")),
         AgentEvent::CompactionFinished {
             before_estimated_tokens,
             after_estimated_tokens,

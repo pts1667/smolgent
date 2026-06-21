@@ -131,24 +131,17 @@ pub mod state;
 /// Tool definitions, registries, built-ins, and compaction tool schemas.
 pub mod tools;
 
-/// Compatibility re-export for context compaction types.
-pub mod compact {
-    pub use crate::session::{
-        CompactionConfig, ContextUsage, ContextUsageBreakdown, ToolCallUsage,
-    };
-}
-
 pub use chat::{
     ChatMessage, ChatRequest, ChatResponse, MessageRole, ReasoningConfig, ReasoningPayload,
     ToolCall, ToolCallFunction,
 };
-pub use compact::{CompactionConfig, ContextUsage, ContextUsageBreakdown, ToolCallUsage};
 pub use error::{Error, Result};
 pub use provider::{ApiKeyRef, ChatProvider, ProviderConfig, ProviderKind};
 pub use secrets::{KeyringCoreSecretStore, SecretStore, native_credential_store};
 pub use session::{
-    AgentEvent, AgentEventReceiver, ChatSession, NotificationConfig, SessionConfig, SessionTurn,
-    TelemetryConfig, TelemetryEvent, TelemetryEventReceiver,
+    AgentEvent, AgentEventReceiver, ChatSession, CompactionConfig, ContextUsage,
+    ContextUsageBreakdown, NotificationConfig, SessionConfig, SessionTurn, TelemetryConfig,
+    TelemetryEvent, TelemetryEventReceiver, ToolCallUsage,
 };
 pub use state::AgentState;
 pub use tools::builtin::{

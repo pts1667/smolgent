@@ -1,6 +1,6 @@
 # smolgent
 
-smolagent is a tiny LLM harness library. It implements an easily configurable tool calling agent.
+smolgent is a tiny LLM harness library. It implements an easily configurable tool calling agent.
 It is designed to be small, secure and easy to use. It has built-in tools for reading, writing, and using ripgrep.
 It preserves reasoning whenever possible.
 

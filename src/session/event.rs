@@ -19,6 +19,8 @@ pub struct NotificationConfig {
     pub tool_rounds: bool,
     /// Emit when a normal tool call starts.
     pub tool_calls: bool,
+    /// Include tool arguments in tool-call events. Arguments may contain secrets or file content.
+    pub tool_payloads: bool,
     /// Emit when a normal tool call succeeds.
     pub tool_results: bool,
     /// Emit when a normal tool call fails.
@@ -38,6 +40,7 @@ impl NotificationConfig {
         Self {
             tool_rounds: true,
             tool_calls: true,
+            tool_payloads: false,
             tool_results: true,
             tool_errors: true,
             compaction: false,
@@ -45,13 +48,14 @@ impl NotificationConfig {
         }
     }
 
-    /// Emit every agent event.
+    /// Emit every agent event, including tool argument payloads.
     pub fn all() -> Self {
         Self {
             model_requests: true,
             model_responses: true,
             tool_rounds: true,
             tool_calls: true,
+            tool_payloads: true,
             tool_results: true,
             tool_errors: true,
             compaction: true,
@@ -64,6 +68,7 @@ impl NotificationConfig {
             || self.model_responses
             || self.tool_rounds
             || self.tool_calls
+            || self.tool_payloads
             || self.tool_results
             || self.tool_errors
             || self.compaction
@@ -92,7 +97,8 @@ pub enum AgentEvent {
         round: usize,
         tool_call_id: String,
         name: String,
-        arguments: String,
+        /// Full arguments when `tool_payloads` is enabled.
+        arguments: Option<String>,
     },
     /// A normal registry tool call succeeded.
     ToolCallFinished {
@@ -125,7 +131,8 @@ pub enum AgentEvent {
     CompactionToolCallStarted {
         tool_call_id: String,
         name: String,
-        arguments: String,
+        /// Full arguments when `tool_payloads` is enabled.
+        arguments: Option<String>,
     },
     /// Context compaction finished.
     CompactionFinished {
@@ -143,7 +150,7 @@ impl NotificationConfig {
             AgentEvent::ModelRequestStarted { .. } => self.model_requests,
             AgentEvent::ModelResponseReceived { .. } => self.model_responses,
             AgentEvent::ToolRoundStarted { .. } => self.tool_rounds,
-            AgentEvent::ToolCallStarted { .. } => self.tool_calls,
+            AgentEvent::ToolCallStarted { .. } => self.tool_calls || self.tool_payloads,
             AgentEvent::ToolCallFinished { .. } => self.tool_results,
             AgentEvent::ToolCallFailed { .. } => self.tool_errors,
             AgentEvent::MaxToolRoundsReached { .. } => self.tool_rounds,

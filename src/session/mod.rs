@@ -573,7 +573,11 @@ impl ChatSession {
         self.emit(AgentEvent::CompactionToolCallStarted {
             tool_call_id: call.id.clone(),
             name: call.function.name.clone(),
-            arguments: call.function.arguments.clone(),
+            arguments: self
+                .config
+                .notifications
+                .tool_payloads
+                .then(|| call.function.arguments.clone()),
         });
         self.emit_tool_call_started_telemetry(call);
 
@@ -638,7 +642,11 @@ impl ChatSession {
                 round,
                 tool_call_id: call.id.clone(),
                 name: call.function.name.clone(),
-                arguments: call.function.arguments.clone(),
+                arguments: self
+                    .config
+                    .notifications
+                    .tool_payloads
+                    .then(|| call.function.arguments.clone()),
             });
         }
         self.emit_tool_call_started_telemetry(call);

@@ -537,7 +537,7 @@ async fn managed_tool_loop_runs_tools_and_emits_events() {
     let events = events.lock().unwrap();
     assert!(
         events.iter().any(
-            |event| matches!(event, AgentEvent::ToolCallStarted { name, .. } if name == "add")
+            |event| matches!(event, AgentEvent::ToolCallStarted { name, arguments: None, .. } if name == "add")
         )
     );
     assert!(events

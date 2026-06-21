@@ -24,6 +24,9 @@ pub enum Error {
     #[error("api key is not configured for provider '{0}'")]
     MissingApiKey(String),
 
+    #[error("provider response exceeded the {limit} byte limit")]
+    ProviderResponseTooLarge { limit: usize },
+
     #[error("no native keyring store is configured for target OS '{0}'")]
     UnsupportedNativeKeyring(&'static str),
 

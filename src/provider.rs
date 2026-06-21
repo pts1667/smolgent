@@ -1,3 +1,4 @@
+use std::fmt;
 use std::sync::Arc;
 
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
@@ -11,6 +12,8 @@ use crate::secrets::SecretStore;
 use crate::tools::ToolDefinition;
 use crate::{Error, Result};
 
+const MAX_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
+
 /// Supported provider presets.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProviderKind {
@@ -23,7 +26,7 @@ pub enum ProviderKind {
 }
 
 /// Where a provider should obtain its API key.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub enum ApiKeyRef {
     /// No API key is sent.
     None,
@@ -31,6 +34,19 @@ pub enum ApiKeyRef {
     Literal(String),
     /// Look up an API key by provider id in the configured [`crate::SecretStore`].
     Keyring(String),
+}
+
+impl fmt::Debug for ApiKeyRef {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::None => formatter.write_str("None"),
+            Self::Literal(_) => formatter
+                .debug_tuple("Literal")
+                .field(&"[REDACTED]")
+                .finish(),
+            Self::Keyring(id) => formatter.debug_tuple("Keyring").field(id).finish(),
+        }
+    }
 }
 
 /// Configuration for an OpenAI-compatible chat-completions provider.
@@ -166,16 +182,34 @@ impl ChatProvider {
 
     /// Send a pre-built request and parse the response.
     pub async fn send_request(&self, request: ChatRequest) -> Result<ChatResponse> {
-        let raw = self
+        let mut response = self
             .client
             .post(self.config.chat_completions_url.clone())
             .headers(self.headers()?)
             .json(&request)
             .send()
             .await?
-            .error_for_status()?
-            .json::<Value>()
-            .await?;
+            .error_for_status()?;
+
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
+        {
+            return Err(Error::ProviderResponseTooLarge {
+                limit: MAX_RESPONSE_BYTES,
+            });
+        }
+
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            if body.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
+                return Err(Error::ProviderResponseTooLarge {
+                    limit: MAX_RESPONSE_BYTES,
+                });
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let raw = serde_json::from_slice::<Value>(&body)?;
 
         self.parse_response(raw)
     }
@@ -251,6 +285,16 @@ mod tests {
     use crate::ReasoningPayload;
     use crate::secrets::{KeyringCoreSecretStore, SecretStore};
 
+    #[test]
+    fn literal_api_keys_are_redacted_from_debug_output() {
+        let api_key = ApiKeyRef::Literal("sk-secret".to_string());
+
+        let debug = format!("{api_key:?}");
+
+        assert_eq!(debug, "Literal(\"[REDACTED]\")");
+        assert!(!debug.contains("sk-secret"));
+    }
+
     #[tokio::test]
     async fn openrouter_request_includes_auth_and_reasoning() {
         let server = MockServer::start();
@@ -294,6 +338,27 @@ mod tests {
             response.reasoning.unwrap().reasoning_content,
             Some("worked it out".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn provider_rejects_oversized_responses_before_buffering_them() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).body("x".repeat(MAX_RESPONSE_BYTES + 1));
+        });
+        let provider =
+            ChatProvider::new(ProviderConfig::llama_cpp(server.base_url(), "local-model").unwrap());
+
+        let error = provider.send_messages(&[]).await.unwrap_err();
+
+        mock.assert();
+        assert!(matches!(
+            error,
+            Error::ProviderResponseTooLarge {
+                limit: MAX_RESPONSE_BYTES
+            }
+        ));
     }
 
     #[tokio::test]

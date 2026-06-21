@@ -109,13 +109,13 @@ struct CompactionEdit {
 
 pub(crate) fn usage_breakdown(turns: &[SessionTurn], limit: usize) -> ContextUsageBreakdown {
     let mut largest_turns = turns.iter().map(turn_usage).collect::<Vec<_>>();
-    largest_turns.sort_by(|a, b| b.estimated_tokens.cmp(&a.estimated_tokens));
+    largest_turns.sort_by_key(|turn| std::cmp::Reverse(turn.estimated_tokens));
     if limit < largest_turns.len() {
         largest_turns.truncate(limit);
     }
 
     let mut largest_tool_calls = tool_call_usages(turns);
-    largest_tool_calls.sort_by(|a, b| b.estimated_tokens.cmp(&a.estimated_tokens));
+    largest_tool_calls.sort_by_key(|call| std::cmp::Reverse(call.estimated_tokens));
     if limit < largest_tool_calls.len() {
         largest_tool_calls.truncate(limit);
     }
