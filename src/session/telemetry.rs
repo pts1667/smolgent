@@ -18,7 +18,7 @@ pub struct TelemetryConfig {
     pub messages: bool,
     /// Emit tool-call metadata.
     pub tool_calls: bool,
-    /// Include tool arguments and tool result content.
+    /// Include tool arguments and tool result text. Media is captured through `model_payloads`.
     pub tool_payloads: bool,
     /// Emit provider/model request and response metadata.
     pub model_metadata: bool,
@@ -74,6 +74,8 @@ impl TelemetryConfig {
 ///
 /// The application owns logging/export. `smolgent` only sends events through the telemetry
 /// receiver returned at session creation.
+/// Message `content` fields contain text only. `content_len` includes encoded media bytes;
+/// complete multimodal messages are available in opt-in model request/response payloads.
 #[derive(Clone, Debug, PartialEq)]
 pub enum TelemetryEvent {
     /// A user message was added to the session.

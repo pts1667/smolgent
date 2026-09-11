@@ -46,6 +46,10 @@ This behaviour is configurable, and can be disabled.
 
 Configure this with `SessionConfig::default().compaction`, or use `CompactionConfig::disabled()` to turn it off.
 
+Each compaction round uses the updated conversation and usage breakdown. If an automatic attempt does not reach its target, further automatic attempts are deferred until the next managed agent run. The model can still use compaction tools during normal tool rounds when `always_offer_tools` is enabled.
+
+Token estimates cover text and metadata only. Media and parsed PDF annotations are excluded because their token costs depend on the model, resolution, duration, and document contents. Track provider usage for media-heavy sessions; automatic compaction cannot reliably predict those costs.
+
 ## Telemetry
 
 Telemetry is opt-in and dependency-free.
@@ -53,6 +57,60 @@ Configure `SessionConfig::telemetry` with `TelemetryConfig::messages()`, `Teleme
 Payload capture is disabled unless you choose `TelemetryConfig::all()` or otherwise enable the payload flags.
 It is the responsibility of the user to actually log the provided content; the library only emits events.
 
-## TODO
+## Multimodal Input (OpenRouter)
 
-- Multimodal input
+Pass an ordered `Vec<ContentPart>` wherever you would pass a user message. It works with direct provider requests, `ChatSession::send_user_message`, and `ChatSession::run_user_message_with_tools`.
+
+```rust
+use smolgent::{ChatMessage, ContentPart};
+
+let message = ChatMessage::user(vec![
+    ContentPart::text("Describe this image."),
+    ContentPart::image_url("https://example.com/image.png"),
+]);
+// provider.send_messages(&[message]).await?;
+```
+
+Following [OpenRouter's multimodal documentation](https://openrouter.ai/docs/guides/overview/multimodal/overview), supported input parts are:
+
+| Input | URL or pre-encoded data | Encode local bytes |
+| --- | --- | --- |
+| Image | `ContentPart::image_url(url_or_data_url)` | `ContentPart::image_bytes("image/png", &bytes)` |
+| PDF | `ContentPart::file("document.pdf", url_or_data_url)` | `ContentPart::pdf_bytes("document.pdf", &bytes)` |
+| Audio | `ContentPart::input_audio(raw_base64, "wav")` | `ContentPart::audio_bytes("wav", &bytes)` |
+| Video | `ContentPart::video_url(url_or_data_url)` | `ContentPart::video_bytes("video/mp4", &bytes)` |
+
+Byte helpers encode data in memory; the application reads files and chooses MIME types/formats. Audio requires raw base64 rather than a URL. Image, PDF, and video byte helpers produce base64 data URLs. Multiple attachments and text parts retain their order. Image detail can be set through `ContentPart::ImageUrl` and `ImageDetail`.
+
+Choose a model that supports the requested modalities. Video URL and media format support depend on the upstream provider/model. OpenRouter handles PDF parsing with its default configuration. Returned PDF annotations and reasoning are preserved in session history for follow-up requests. These input formats are tested against OpenRouter's wire protocol; support at other compatible endpoints depends on their capabilities. Media generation and dedicated speech endpoints are outside this input API.
+
+The image/video example uses `z-ai/glm-5.3-flash` on OpenRouter and the same keyring entry as `openrouter_chat`. Pass one or more local paths, each followed by its MIME type:
+
+```powershell
+cargo run --example openrouter_multimodal -- ./image.png image/png
+cargo run --example openrouter_multimodal -- ./clip.mp4 video/mp4
+cargo run --example openrouter_multimodal -- --prompt "Does this image appear in the video?" ./image.png image/png ./clip.mp4 video/mp4
+```
+
+It encodes media as base64 data URLs and sends the prompt and attachments in one message. Use `--help` for usage. This example selects the model explicitly; `OPENROUTER_MODEL` does not override it.
+
+`ChatMessage::content` and `SessionTurn::content` now use `MessageContent` (`Text` or `Parts`) instead of `String`. Existing string constructors and text-only JSON stay the same. Use `.content.text()` to read text, `.content.to_string()` for an owned display string, or match `MessageContent::Parts` to inspect attachments. Struct literals need `content: text.into()` and `annotations: Vec::new()`. Display and message telemetry include text only; full media payloads are included in model telemetry only when `model_payloads` is enabled.
+
+## Model-aware Read Tool
+
+Use `builtin_registry_for_provider(state, &provider).await?` instead of `builtin_registry(state)` to enable model-aware reading. It looks up the configured OpenRouter model through the [model metadata endpoint](https://openrouter.ai/docs/api/api-reference/models/get-a-model-by-its-slug) and uses `architecture.input_modalities` to extend the `read` description and handler. The registry captures capabilities once; rebuild it when switching models.
+
+Supported inputs enable matching local file types: images, video, audio, and PDFs when `file` input is advertised. Media reads infer the format from the extension, enforce allowed read roots, and attach the complete file as content parts. Each media file is capped at 20 MiB before encoding; text offsets/counts are rejected for media. Text reading keeps its existing pagination and limits. Upstream model limits can be lower.
+
+Unknown models, automatic routing (`openrouter/auto`), missing metadata, and other providers retain the text-only reader. Discovery errors are returned to the application. `full_cli` reports these errors and falls back to text-only reading, so a failed lookup does not block normal text use.
+
+For example, with `OPENROUTER_API_KEY` configured in the environment or `.env`:
+
+```powershell
+$env:OPENROUTER_MODEL = "z-ai/glm-5.3-flash"
+cargo run --release --example full_cli -- ./media --read-only
+```
+
+Then ask the agent to read and compare files such as `image.png` and `clip.mp4` in that directory. The CLI discovers capabilities at startup. You can also query `provider.model_capabilities().await?` directly or construct `read_tool_with_capabilities(state, capabilities)` with a previously fetched snapshot.
+
+`ToolResult::content` now also uses `MessageContent`; use `.text()` or `.to_string()` when consuming its text. Custom media tools use `Tool::new_multimodal` and return `MessageContent`. Existing `Tool::new` handlers and macro-generated tools keep their JSON-to-text behavior, so ordinary JSON arrays are never mistaken for media. Tool telemetry exposes text only; full attachments are available through model payload telemetry.

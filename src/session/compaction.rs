@@ -10,6 +10,9 @@ use crate::{Error, Result};
 /// When enabled, the managed tool loop can ask the model to remove or summarize older turns using
 /// built-in compaction tools. Explicit compaction is triggered before a normal model request when
 /// the estimated token count reaches [`CompactionConfig::trigger_estimated_tokens`].
+/// Estimates cover text and metadata only; media token costs and parsed file annotations are
+/// excluded because their tokenization depends on the model and media properties. For media-heavy
+/// sessions, applications should track provider usage rather than relying on this trigger alone.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompactionConfig {
     /// Whether compaction tools and trigger checks are enabled.
@@ -170,7 +173,9 @@ pub(crate) fn summarize_messages(
             "Compacted context summary: {}\nCompaction reason: {}",
             summary.trim(),
             reason.trim()
-        ),
+        )
+        .into(),
+        annotations: Vec::new(),
         reasoning: None,
         tool_calls: Vec::new(),
         tool_call_id: None,
@@ -326,7 +331,9 @@ fn apply_compaction_edit(
             turn.tool_calls
                 .retain(|call| !edit.remove_tool_call_ids.contains(&call.id));
             if turn.role == MessageRole::Assistant
-                && turn.content.trim().is_empty()
+                && turn.content.text().trim().is_empty()
+                && !turn.content.has_media()
+                && turn.annotations.is_empty()
                 && turn.tool_calls.is_empty()
             {
                 continue;
@@ -439,12 +446,17 @@ fn turn_usage(turn: &SessionTurn) -> ContextUsage {
         name: turn.name.clone(),
         bytes,
         estimated_tokens: estimate_tokens_from_chars(estimate_turn_chars(turn)),
-        summary: preview(&turn.content, 180),
+        summary: preview(&turn.content.text(), 180),
     }
 }
 
 fn estimate_turn_bytes(turn: &SessionTurn) -> usize {
     let mut bytes = turn.content.len();
+    bytes += turn
+        .annotations
+        .iter()
+        .map(|value| value.to_string().len())
+        .sum::<usize>();
     if let Some(reasoning) = &turn.reasoning {
         if let Some(reasoning) = &reasoning.reasoning {
             bytes += reasoning.to_string().len();
@@ -470,7 +482,9 @@ fn estimate_turn_bytes(turn: &SessionTurn) -> usize {
 }
 
 fn estimate_turn_chars(turn: &SessionTurn) -> usize {
-    let mut chars = turn.content.chars().count();
+    // Media token costs depend on model, resolution, and duration. Base64 size is not
+    // a text token count; this estimate covers text and tool/reasoning metadata only.
+    let mut chars = turn.content.text().chars().count();
     if let Some(reasoning) = &turn.reasoning {
         if let Some(reasoning) = &reasoning.reasoning {
             chars += reasoning.to_string().chars().count();

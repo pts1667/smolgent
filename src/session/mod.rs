@@ -6,11 +6,17 @@ pub use compaction::{CompactionConfig, ContextUsage, ContextUsageBreakdown, Tool
 pub use event::{AgentEvent, AgentEventReceiver, NotificationConfig};
 pub use telemetry::{TelemetryConfig, TelemetryEvent, TelemetryEventReceiver};
 
+enum CompactionOutcome {
+    NotNeeded,
+    TargetReached,
+    TargetNotReached,
+}
+
 use std::fmt;
 use std::sync::mpsc::{SyncSender, sync_channel};
 
 use crate::chat::{
-    ChatMessage, ChatRequest, ChatResponse, MessageRole, ReasoningPayload, ToolCall,
+    ChatMessage, ChatRequest, ChatResponse, MessageContent, MessageRole, ReasoningPayload, ToolCall,
 };
 use crate::provider::ChatProvider;
 use crate::tools::compact::{
@@ -30,7 +36,8 @@ use crate::{Error, Result};
 pub struct SessionTurn {
     pub id: u64,
     pub role: MessageRole,
-    pub content: String,
+    pub content: MessageContent,
+    pub annotations: Vec<serde_json::Value>,
     pub reasoning: Option<ReasoningPayload>,
     pub tool_calls: Vec<ToolCall>,
     pub tool_call_id: Option<String>,
@@ -50,6 +57,7 @@ impl From<ChatMessage> for SessionTurn {
             id: 0,
             role: message.role,
             content: message.content,
+            annotations: message.annotations,
             reasoning,
             tool_calls: message.tool_calls,
             tool_call_id: message.tool_call_id,
@@ -61,6 +69,7 @@ impl From<ChatMessage> for SessionTurn {
 impl From<SessionTurn> for ChatMessage {
     fn from(turn: SessionTurn) -> Self {
         let mut message = ChatMessage::new(turn.role, turn.content);
+        message.annotations = turn.annotations;
         message.tool_calls = turn.tool_calls;
         message.tool_call_id = turn.tool_call_id;
         message.name = turn.name;
@@ -96,7 +105,7 @@ pub struct SessionConfig {
 impl Default for SessionConfig {
     fn default() -> Self {
         Self {
-            max_tool_rounds: 8,
+            max_tool_rounds: 32,
             event_channel_capacity: None,
             notifications: NotificationConfig::default(),
             compaction: CompactionConfig::default(),
@@ -285,12 +294,12 @@ impl ChatSession {
     }
 
     /// Append a user message.
-    pub fn push_user(&mut self, content: impl Into<String>) {
+    pub fn push_user(&mut self, content: impl Into<MessageContent>) {
         self.push(ChatMessage::user(content));
     }
 
     /// Append a plain assistant message.
-    pub fn push_assistant(&mut self, content: impl Into<String>) {
+    pub fn push_assistant(&mut self, content: impl Into<MessageContent>) {
         self.push(ChatMessage::assistant(content));
     }
 
@@ -357,7 +366,7 @@ impl ChatSession {
     pub async fn send_user_message(
         &mut self,
         provider: &ChatProvider,
-        content: impl Into<String>,
+        content: impl Into<MessageContent>,
     ) -> Result<ChatResponse> {
         self.push_user(content);
         self.complete(provider).await
@@ -396,7 +405,7 @@ impl ChatSession {
         &mut self,
         provider: &ChatProvider,
         registry: &ToolRegistry,
-        content: impl Into<String>,
+        content: impl Into<MessageContent>,
     ) -> Result<ChatResponse> {
         self.push_user(content);
         self.run_with_tools(provider, registry).await
@@ -406,15 +415,23 @@ impl ChatSession {
     ///
     /// Built-in compaction tools are offered according to [`CompactionConfig`]. Normal tool rounds
     /// are bounded by [`SessionConfig::max_tool_rounds`].
+    /// If automatic compaction fails to reach its target, further automatic attempts are
+    /// deferred until the next call to this method. Proactive compaction tools remain available.
     pub async fn run_with_tools(
         &mut self,
         provider: &ChatProvider,
         registry: &ToolRegistry,
     ) -> Result<ChatResponse> {
         let mut completed_tool_rounds = 0;
+        let mut compaction_stalled = false;
 
         loop {
-            self.maybe_compact(provider).await?;
+            if !compaction_stalled {
+                compaction_stalled = matches!(
+                    self.maybe_compact(provider).await?,
+                    CompactionOutcome::TargetNotReached
+                );
+            }
             self.emit(AgentEvent::ModelRequestStarted {
                 completed_tool_rounds,
             });
@@ -465,14 +482,14 @@ impl ChatSession {
         }
     }
 
-    async fn maybe_compact(&mut self, provider: &ChatProvider) -> Result<()> {
+    async fn maybe_compact(&mut self, provider: &ChatProvider) -> Result<CompactionOutcome> {
         if !self.config.compaction.enabled {
-            return Ok(());
+            return Ok(CompactionOutcome::NotNeeded);
         }
 
         let initial_estimate = self.estimated_context_tokens();
         if initial_estimate < self.config.compaction.trigger_estimated_tokens {
-            return Ok(());
+            return Ok(CompactionOutcome::NotNeeded);
         }
         self.remove_previous_compaction_tool_messages();
         let before = self.estimated_context_tokens();
@@ -489,20 +506,19 @@ impl ChatSession {
             largest_tool_calls: breakdown.largest_tool_calls.clone(),
         });
 
-        let mut transient_messages = self.messages();
-        transient_messages.push(ChatMessage::system(compaction::instruction(
-            &self.config.compaction,
-            &breakdown,
-        )));
-
         let mut rounds = 0;
         while rounds < self.config.compaction.max_compaction_rounds {
+            // Compaction tools mutate persisted history. Rebuild both the conversation
+            // and turn-ID/usage instructions so the next round sees those edits.
+            let breakdown =
+                self.context_usage_breakdown_with_limit(self.config.compaction.top_consumers);
+            let mut transient_messages = self.messages();
+            transient_messages.push(ChatMessage::system(compaction::instruction(
+                &self.config.compaction,
+                &breakdown,
+            )));
             let response = self
-                .send_provider_request(
-                    provider,
-                    transient_messages.clone(),
-                    compaction_tool_definitions(),
-                )
+                .send_provider_request(provider, transient_messages, compaction_tool_definitions())
                 .await?;
             if response.message.tool_calls.is_empty() {
                 self.emit(AgentEvent::CompactionSkipped {
@@ -512,15 +528,10 @@ impl ChatSession {
             }
 
             self.push(response.message.clone());
-            transient_messages.push(response.message.clone());
-            let mut result_messages = Vec::new();
             for call in &response.message.tool_calls {
                 let result = self.execute_compaction_tool_call(call);
-                let message = result.into_message();
-                self.push(message.clone());
-                result_messages.push(message);
+                self.push(result.into_message());
             }
-            transient_messages.extend(result_messages);
             rounds += 1;
 
             if self.estimated_context_tokens() <= self.config.compaction.target_estimated_tokens {
@@ -534,7 +545,11 @@ impl ChatSession {
             after_estimated_tokens: after,
             rounds,
         });
-        Ok(())
+        Ok(if after <= self.config.compaction.target_estimated_tokens {
+            CompactionOutcome::TargetReached
+        } else {
+            CompactionOutcome::TargetNotReached
+        })
     }
 
     async fn send_provider_request(
@@ -596,7 +611,7 @@ impl ChatSession {
             Ok(content) => ToolResult {
                 tool_call_id: call.id.clone(),
                 name: call.function.name.clone(),
-                content: compaction_acknowledgement(&call.function.name, &content),
+                content: compaction_acknowledgement(&call.function.name, &content).into(),
             },
             Err(error) => ToolResult::error(call, error),
         };
@@ -706,13 +721,21 @@ impl ChatSession {
             MessageRole::User => self.emit_telemetry(TelemetryEvent::UserMessage {
                 turn_id: turn.id,
                 content_len: turn.content.len(),
-                content: self.config.telemetry.messages.then(|| turn.content.clone()),
+                content: self
+                    .config
+                    .telemetry
+                    .messages
+                    .then(|| turn.content.to_string()),
             }),
             MessageRole::Assistant => self.emit_telemetry(TelemetryEvent::AssistantMessage {
                 turn_id: turn.id,
                 content_len: turn.content.len(),
                 tool_calls: turn.tool_calls.len(),
-                content: self.config.telemetry.messages.then(|| turn.content.clone()),
+                content: self
+                    .config
+                    .telemetry
+                    .messages
+                    .then(|| turn.content.to_string()),
             }),
             MessageRole::Tool => self.emit_telemetry(TelemetryEvent::ToolMessage {
                 turn_id: turn.id,
@@ -723,7 +746,7 @@ impl ChatSession {
                     .config
                     .telemetry
                     .tool_payloads
-                    .then(|| turn.content.clone()),
+                    .then(|| turn.content.to_string()),
             }),
             MessageRole::System => {}
         }
@@ -779,11 +802,11 @@ impl ChatSession {
                 .config
                 .telemetry
                 .tool_payloads
-                .then(|| result.content.clone()),
+                .then(|| result.content.to_string()),
         });
 
-        if result.content.starts_with("Tool error:") {
-            self.emit_tool_error_telemetry(call, &Error::Tool(result.content.clone()));
+        if result.content.text().starts_with("Tool error:") {
+            self.emit_tool_error_telemetry(call, &Error::Tool(result.content.to_string()));
         }
     }
 

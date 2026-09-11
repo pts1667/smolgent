@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub use crate::content::{ContentPart, MessageContent};
 use crate::tools::ToolDefinition;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -37,7 +38,10 @@ impl ReasoningPayload {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ChatMessage {
     pub role: MessageRole,
-    pub content: String,
+    pub content: MessageContent,
+    /// Provider annotations, including parsed PDF content reused on subsequent requests.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub annotations: Vec<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -53,10 +57,11 @@ pub struct ChatMessage {
 }
 
 impl ChatMessage {
-    pub fn new(role: MessageRole, content: impl Into<String>) -> Self {
+    pub fn new(role: MessageRole, content: impl Into<MessageContent>) -> Self {
         Self {
             role,
             content: content.into(),
+            annotations: Vec::new(),
             reasoning: None,
             reasoning_content: None,
             reasoning_details: None,
@@ -67,14 +72,14 @@ impl ChatMessage {
     }
 
     pub fn system(content: impl Into<String>) -> Self {
-        Self::new(MessageRole::System, content)
+        Self::new(MessageRole::System, content.into())
     }
 
-    pub fn user(content: impl Into<String>) -> Self {
+    pub fn user(content: impl Into<MessageContent>) -> Self {
         Self::new(MessageRole::User, content)
     }
 
-    pub fn assistant(content: impl Into<String>) -> Self {
+    pub fn assistant(content: impl Into<MessageContent>) -> Self {
         Self::new(MessageRole::Assistant, content)
     }
 
@@ -110,11 +115,12 @@ impl ChatMessage {
     pub fn tool_result(
         tool_call_id: impl Into<String>,
         name: impl Into<String>,
-        content: impl Into<String>,
+        content: impl Into<MessageContent>,
     ) -> Self {
         Self {
             role: MessageRole::Tool,
             content: content.into(),
+            annotations: Vec::new(),
             reasoning: None,
             reasoning_content: None,
             reasoning_details: None,
@@ -199,7 +205,9 @@ pub(crate) struct ChatCompletionChoice {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct AssistantWireMessage {
-    pub content: Option<String>,
+    pub content: Option<MessageContent>,
+    #[serde(default)]
+    pub annotations: Vec<Value>,
     #[serde(default)]
     pub reasoning: Option<Value>,
     #[serde(default)]
@@ -213,12 +221,19 @@ pub(crate) struct AssistantWireMessage {
 impl AssistantWireMessage {
     pub fn into_chat_message(self) -> ChatMessage {
         let mut content = self.content.unwrap_or_default();
-        if !self.tool_calls.is_empty() && contains_leaked_tool_markup(&content) {
-            content.clear();
+        if !self.tool_calls.is_empty() && contains_leaked_tool_markup(&content.text()) {
+            match &mut content {
+                MessageContent::Text(text) => text.clear(),
+                MessageContent::Parts(parts) => parts.retain(|part| {
+                    !matches!(part,
+                    ContentPart::Text { text } if contains_leaked_tool_markup(text))
+                }),
+            }
         }
         ChatMessage {
             role: MessageRole::Assistant,
             content,
+            annotations: self.annotations,
             reasoning: self.reasoning,
             reasoning_content: self.reasoning_content,
             reasoning_details: self.reasoning_details,
@@ -240,6 +255,7 @@ mod tests {
     #[test]
     fn structured_tool_calls_discard_leaked_dsml_content() {
         let message = AssistantWireMessage {
+            annotations: Vec::new(),
             content: Some(
                 "Let me check. <｜DSML｜tool_calls><｜DSML｜invoke name=\"read\">".into(),
             ),
@@ -264,6 +280,7 @@ mod tests {
     #[test]
     fn ordinary_tool_call_preambles_are_preserved() {
         let message = AssistantWireMessage {
+            annotations: Vec::new(),
             content: Some("Let me check that file.".into()),
             reasoning: None,
             reasoning_content: None,

@@ -72,6 +72,8 @@ Example:
 
 const RIPGREP_DESCRIPTION: &str = r#"Search allowed read roots with ripgrep.
 
+Matches are grouped by file: the path is printed once as a heading, followed by matching lines.
+
 Required parameters:
 - pattern: regex or literal text to search for.
 - paths: one or more files/directories to search. Each path must be under an allowed read root.
@@ -353,6 +355,7 @@ fn ripgrep(#[tool(context)] state: &AgentState, #[tool(arguments)] args: RgArgs)
     if args.files {
         command.arg("--files");
     } else {
+        command.args(["--heading", "--with-filename", "--color=never"]);
         if args.fixed_strings {
             command.arg("--fixed-strings");
         }
@@ -466,7 +469,7 @@ fn apply_patch(
     Ok(changed.join("\n"))
 }
 
-fn ensure_can_read(state: &AgentState, path: &Path) -> Result<PathBuf> {
+pub(super) fn ensure_can_read(state: &AgentState, path: &Path) -> Result<PathBuf> {
     state
         .readable_path(path)
         .ok_or_else(|| Error::PathNotAllowed {
@@ -484,7 +487,7 @@ fn ensure_can_write(state: &AgentState, path: &Path) -> Result<PathBuf> {
         })
 }
 
-fn tool_path(path: &Path) -> PathBuf {
+pub(super) fn tool_path(path: &Path) -> PathBuf {
     strip_windows_verbatim_prefix(path)
 }
 

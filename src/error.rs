@@ -6,6 +6,11 @@ pub enum Error {
     #[error("http error: {0}")]
     Http(#[from] reqwest::Error),
 
+    /// An unsuccessful HTTP response. The body is limited to a 16 KiB prefix
+    /// (decoded as UTF-8), with a notice appended if it was truncated.
+    #[error("provider returned HTTP {status}: {body}")]
+    Provider { status: u16, body: String },
+
     #[error("url error: {0}")]
     Url(#[from] url::ParseError),
 

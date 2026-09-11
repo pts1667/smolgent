@@ -19,9 +19,10 @@ use serde_json::Value;
 use smolgent::{
     AgentEvent, AgentEventReceiver, AgentState, ApiKeyRef, ChatProvider, ChatResponse, ChatSession,
     Error, NotificationConfig, ProviderConfig, SessionConfig, builtin_registry,
+    builtin_registry_for_provider,
 };
 
-const MODEL: &str = "deepseek/deepseek-v4-flash";
+const MODEL: &str = "deepseek/deepseek-v4.1-flash";
 
 /**
  * Example of a full CLI app for using smolgent.
@@ -56,8 +57,17 @@ async fn run_app(
         AgentState::new([input_dir.clone()], [input_dir.clone()])
     };
     let display_input_dir = user_facing_path(&input_dir);
-    let registry = builtin_registry(state);
     let provider = openrouter_provider(api_key)?;
+    let (registry, discovery_error) =
+        match builtin_registry_for_provider(state.clone(), &provider).await {
+            Ok(registry) => (registry, None),
+            Err(error) => (
+                builtin_registry(state),
+                Some(format!(
+                    "Model capability lookup failed; read supports text only: {error}"
+                )),
+            ),
+        };
     let (session, events) = ChatSession::with_system_prompt_and_config(
         system_prompt(&display_input_dir, read_only),
         SessionConfig {
@@ -70,6 +80,9 @@ async fn run_app(
     let mut session = Some(session);
     let mut running: Option<RunningAnswer> = None;
     let mut app = AppState::new(display_input_dir, read_only);
+    if let Some(error) = discovery_error {
+        app.push_chat("System", error);
+    }
 
     draw(&mut terminal, &app)?;
 
@@ -89,7 +102,7 @@ async fn run_app(
                 Ok(response) => {
                     drain_agent_statuses(&statuses, &mut app);
                     app.set_status("ready");
-                    app.push_chat("Assistant", response.message.content);
+                    app.push_chat("Assistant", response.message.content.to_string());
                 }
                 Err(err) => {
                     drain_agent_statuses(&statuses, &mut app);
@@ -192,7 +205,8 @@ fn spawn_agent_status_thread(events: AgentEventReceiver) -> Receiver<String> {
 }
 
 fn openrouter_provider(api_key: String) -> smolgent::Result<ChatProvider> {
-    let mut config = ProviderConfig::openrouter(MODEL)?;
+    let model = env::var("OPENROUTER_MODEL").unwrap_or_else(|_| MODEL.to_string());
+    let mut config = ProviderConfig::openrouter(model)?;
     config.api_key = ApiKeyRef::Literal(api_key);
     Ok(ChatProvider::new(config))
 }

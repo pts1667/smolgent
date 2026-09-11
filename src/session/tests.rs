@@ -10,6 +10,40 @@ use crate::chat::ToolCallFunction;
 use crate::{ChatProvider, ProviderConfig, Tool, ToolDefinition};
 
 #[test]
+fn compaction_keeps_unselected_media_and_annotations_when_removing_tool_calls() {
+    let (mut session, _) = ChatSession::with_config(SessionConfig {
+        compaction: CompactionConfig {
+            protect_recent_turns: 0,
+            ..CompactionConfig::default()
+        },
+        ..SessionConfig::default()
+    });
+    session.push_system("system");
+    let media = ChatMessage::assistant(vec![crate::ContentPart::image_url(
+        "https://example.com/image.png",
+    )]);
+    session.push(media.clone());
+    let mut annotated = ChatMessage::assistant("");
+    annotated.annotations =
+        vec![json!({"type": "file", "file": {"hash": "parsed", "content": []}})];
+    session.push(annotated.clone());
+    session.push(ChatMessage::assistant("").with_tool_calls(vec![ToolCall {
+        id: "call_1".into(),
+        kind: "function".into(),
+        function: ToolCallFunction {
+            name: "read".into(),
+            arguments: "{}".into(),
+        },
+    }]));
+    session.push(ChatMessage::tool_result("call_1", "read", "stale contents"));
+    session.compact_remove_messages(&[5], "stale read").unwrap();
+    assert_eq!(
+        session.messages(),
+        vec![ChatMessage::system("system"), media, annotated]
+    );
+}
+
+#[test]
 fn sessions_preserve_reasoning_in_history() {
     let mut session = ChatSession::new();
     session.push(
@@ -136,6 +170,7 @@ fn compaction_summarizes_selected_messages() {
     assert!(
         session.turns()[1]
             .content
+            .text()
             .contains("The old answer was useful.")
     );
 }
@@ -167,7 +202,7 @@ fn explicit_compaction_cleanup_removes_prior_compaction_tool_messages() {
         session
             .turns()
             .iter()
-            .any(|turn| turn.content.contains("keep this useful summary"))
+            .any(|turn| turn.content.text().contains("keep this useful summary"))
     );
     assert!(
         session
@@ -202,6 +237,7 @@ async fn sessions_can_record_tool_errors_without_failing() {
     assert!(
         results[0]
             .content
+            .text()
             .contains("Tool error: unknown tool 'read'")
     );
     assert_eq!(messages[0].tool_call_id.as_deref(), Some("call_1"));
@@ -320,6 +356,162 @@ fn tool_telemetry_redacts_payloads_unless_enabled() {
 }
 
 #[tokio::test]
+async fn compaction_rounds_rebuild_history_and_instructions_after_edits() {
+    for tool_name in [COMPACT_REMOVE_MESSAGES, COMPACT_SUMMARIZE_MESSAGES] {
+        let server = MockServer::start();
+        let arguments = if tool_name == COMPACT_REMOVE_MESSAGES {
+            json!({"turn_ids": [2], "reason": "obsolete"})
+        } else {
+            json!({"turn_ids": [2], "summary": "Keep this conclusion", "reason": "condensed"})
+        };
+        let first = server.mock(|when, then| {
+            when.method(POST)
+                .body_contains("Context compaction is required")
+                .body_contains("OLD_PAYLOAD_TO_REMOVE");
+            then.status(200).json_body(json!({"choices": [{"message": {
+                "content": null, "tool_calls": [{
+                    "id": "compact_1", "type": "function",
+                    "function": {"name": tool_name, "arguments": arguments.to_string()}
+                }]
+            }}]}));
+        });
+        let second = server.mock(|when, then| {
+            when.method(POST)
+                .body_contains("Context compaction is required")
+                .body_contains("Compaction acknowledged:");
+            then.status(200)
+                .json_body(json!({"choices": [{"message": {"content": "Done"}}]}));
+        });
+        let provider =
+            ChatProvider::new(ProviderConfig::llama_cpp(server.base_url(), "model").unwrap());
+        let (mut session, _, telemetry) = ChatSession::with_config_and_telemetry(SessionConfig {
+            compaction: CompactionConfig {
+                trigger_estimated_tokens: 1,
+                target_estimated_tokens: 0,
+                max_compaction_rounds: 2,
+                protect_recent_turns: 0,
+                ..CompactionConfig::default()
+            },
+            telemetry: TelemetryConfig {
+                model_payloads: true,
+                ..TelemetryConfig::default()
+            },
+            ..SessionConfig::default()
+        });
+        session.push_system("system");
+        session.push_user("OLD_PAYLOAD_TO_REMOVE");
+        session.push_user("current question");
+        session.maybe_compact(&provider).await.unwrap();
+        first.assert();
+        second.assert();
+
+        let requests = telemetry
+            .unwrap()
+            .try_iter()
+            .filter_map(|event| match event {
+                TelemetryEvent::ModelRequest { request, .. } => request,
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(requests.len(), 2);
+        let mut messages = requests[1].messages.clone();
+        let instruction = messages.pop().unwrap();
+        assert_eq!(messages, session.messages());
+        assert!(
+            !serde_json::to_string(&requests[1])
+                .unwrap()
+                .contains("OLD_PAYLOAD_TO_REMOVE")
+        );
+        assert_eq!(
+            instruction,
+            ChatMessage::system(compaction::instruction(
+                &session.config.compaction,
+                &session
+                    .context_usage_breakdown_with_limit(session.config.compaction.top_consumers),
+            ))
+        );
+        assert_eq!(messages[messages.len() - 2].tool_calls[0].id, "compact_1");
+        assert_eq!(
+            messages.last().unwrap().tool_call_id.as_deref(),
+            Some("compact_1")
+        );
+        if tool_name == COMPACT_SUMMARIZE_MESSAGES {
+            assert!(
+                messages
+                    .iter()
+                    .any(|message| message.content.text().contains("Keep this conclusion"))
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn unsuccessful_compaction_retries_only_on_the_next_agent_run() {
+    // Cover both a declined attempt and an attempt that exhausts its tool-round budget.
+    for compaction_message in [
+        json!({"content": "Nothing to compact"}),
+        json!({"content": null, "tool_calls": [{
+            "id": "invalid_compaction", "type": "function",
+            "function": {"name": COMPACT_REMOVE_MESSAGES, "arguments": "{\"turn_ids\":[999]}"}
+        }]}),
+    ] {
+        let server = MockServer::start();
+        let compact = server.mock(|when, then| {
+            when.method(POST)
+                .body_contains("Context compaction is required");
+            then.status(200)
+                .json_body(json!({"choices": [{"message": compaction_message}]}));
+        });
+        let tool = server.mock(|when, then| {
+            when.method(POST).matches(|request| {
+                let body: serde_json::Value =
+                    serde_json::from_slice(request.body.as_deref().unwrap()).unwrap();
+                let last = body["messages"].as_array().unwrap().last().unwrap();
+                last["role"] == "user"
+                    || (last["role"] == "tool" && last["tool_call_id"] == "invalid_compaction")
+            });
+            then.status(200).json_body(json!({"choices": [{"message": {
+                "content": null, "tool_calls": [{
+                    "id": "normal_tool", "type": "function",
+                    "function": {"name": "missing_tool", "arguments": "{}"}
+                }]
+            }}]}));
+        });
+        let answer = server.mock(|when, then| {
+            when.method(POST).matches(|request| {
+                let body: serde_json::Value =
+                    serde_json::from_slice(request.body.as_deref().unwrap()).unwrap();
+                let last = body["messages"].as_array().unwrap().last().unwrap();
+                last["role"] == "tool" && last["tool_call_id"] == "normal_tool"
+            });
+            then.status(200)
+                .json_body(json!({"choices": [{"message": {"content": "answer"}}]}));
+        });
+        let provider =
+            ChatProvider::new(ProviderConfig::llama_cpp(server.base_url(), "model").unwrap());
+        let (mut session, _) = ChatSession::with_config(SessionConfig {
+            compaction: CompactionConfig {
+                trigger_estimated_tokens: 1,
+                target_estimated_tokens: 0,
+                max_compaction_rounds: 1,
+                ..CompactionConfig::default()
+            },
+            ..SessionConfig::default()
+        });
+        for run in 1..=2 {
+            let response = session
+                .run_user_message_with_tools(&provider, &ToolRegistry::new(), "Please answer")
+                .await
+                .unwrap();
+            assert_eq!(response.message.content, "answer");
+            compact.assert_hits(run);
+        }
+        tool.assert_hits(2);
+        answer.assert_hits(2);
+    }
+}
+
+#[tokio::test]
 async fn managed_loop_compacts_before_normal_request() {
     let server = MockServer::start();
     let compaction_mock = server.mock(|when, then| {
@@ -387,14 +579,14 @@ async fn managed_loop_compacts_before_normal_request() {
         session
             .turns()
             .iter()
-            .all(|turn| !turn.content.contains("old huge content"))
+            .all(|turn| !turn.content.text().contains("old huge content"))
     );
     assert!(
         session
             .turns()
             .iter()
             .any(|turn| turn.name.as_deref() == Some(COMPACT_REMOVE_MESSAGES)
-                && turn.content.starts_with("Compaction acknowledged:"))
+                && turn.content.text().starts_with("Compaction acknowledged:"))
     );
 }
 
@@ -438,9 +630,10 @@ fn proactive_compaction_calls_are_persisted_as_acknowledgements() {
     assert!(
         acknowledgement
             .content
+            .text()
             .starts_with("Compaction acknowledged:")
     );
-    assert!(!acknowledgement.content.contains("old topic"));
+    assert!(!acknowledgement.content.text().contains("old topic"));
 }
 
 #[tokio::test]
@@ -639,7 +832,7 @@ async fn managed_tool_loop_runs_mixed_compaction_and_registry_tools() {
     assert_eq!(response.message.content, "2 + 3 = 5");
     assert!(session.turns().iter().any(|turn| turn.name.as_deref()
         == Some(COMPACT_SUMMARIZE_MESSAGES)
-        && turn.content.starts_with("Compaction acknowledged:")));
+        && turn.content.text().starts_with("Compaction acknowledged:")));
     assert!(
         session
             .turns()

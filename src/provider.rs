@@ -2,6 +2,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use url::Url;
 
@@ -13,6 +14,21 @@ use crate::tools::ToolDefinition;
 use crate::{Error, Result};
 
 const MAX_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
+const MAX_ERROR_BODY_BYTES: usize = 16 * 1024;
+
+/// Input modalities advertised by the configured model, not its output capabilities.
+/// Format/size limits and upstream availability still depend on the selected model.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ModelCapabilities {
+    pub model: String,
+    pub input_modalities: Vec<String>,
+}
+
+impl ModelCapabilities {
+    pub fn supports_input(&self, modality: &str) -> bool {
+        self.input_modalities.iter().any(|input| input == modality)
+    }
+}
 
 /// Supported provider presets.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -147,6 +163,52 @@ impl ChatProvider {
         &self.config
     }
 
+    /// Look up the configured OpenRouter model's input modalities.
+    ///
+    /// Returns `None` for other providers, automatic routing, unknown model IDs, or missing
+    /// modality metadata. Known aliases and variant suffixes are resolved by OpenRouter.
+    /// Fetch once when constructing tools; rebuild them if the application's model changes.
+    pub async fn model_capabilities(&self) -> Result<Option<ModelCapabilities>> {
+        let model = &self.config.default_model;
+        if self.config.kind != ProviderKind::OpenRouter || model == "openrouter/auto" {
+            return Ok(None);
+        }
+        let segments = model.split('/').collect::<Vec<_>>();
+        if segments.len() != 2
+            || segments
+                .iter()
+                .any(|segment| segment.is_empty() || *segment == "." || *segment == "..")
+        {
+            return Ok(None);
+        }
+        let mut url = self.config.chat_completions_url.join("../model/")?;
+        url.path_segments_mut()
+            .map_err(|_| Error::Tool("provider URL cannot contain model paths".into()))?
+            .pop_if_empty()
+            .extend(segments);
+        let response = self
+            .client
+            .get(url)
+            .headers(self.headers()?)
+            .timeout(std::time::Duration::from_secs(15))
+            .send()
+            .await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let raw = Self::read_response_json(response).await?;
+        let Some(modalities) = raw.pointer("/data/architecture/input_modalities") else {
+            return Ok(None);
+        };
+        if modalities.is_null() {
+            return Ok(None);
+        }
+        Ok(Some(ModelCapabilities {
+            model: model.clone(),
+            input_modalities: serde_json::from_value(modalities.clone())?,
+        }))
+    }
+
     /// Send messages without tools.
     pub async fn send_messages(&self, messages: &[ChatMessage]) -> Result<ChatResponse> {
         self.send_messages_with_tools(messages, Vec::new()).await
@@ -182,14 +244,48 @@ impl ChatProvider {
 
     /// Send a pre-built request and parse the response.
     pub async fn send_request(&self, request: ChatRequest) -> Result<ChatResponse> {
-        let mut response = self
+        let response = self
             .client
             .post(self.config.chat_completions_url.clone())
             .headers(self.headers()?)
             .json(&request)
             .send()
-            .await?
-            .error_for_status()?;
+            .await?;
+
+        self.parse_response(Self::read_response_json(response).await?)
+    }
+
+    async fn read_response_json(mut response: reqwest::Response) -> Result<Value> {
+        let status = response.status();
+        if !status.is_success() {
+            // Read only a bounded prefix, including for non-JSON gateway errors.
+            // One extra byte distinguishes a full body from a truncated one.
+            let mut body = Vec::new();
+            while let Some(chunk) = response.chunk().await? {
+                let remaining = MAX_ERROR_BODY_BYTES + 1 - body.len();
+                body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+                if body.len() > MAX_ERROR_BODY_BYTES {
+                    break;
+                }
+            }
+            let truncated = body.len() > MAX_ERROR_BODY_BYTES;
+            body.truncate(MAX_ERROR_BODY_BYTES);
+            // Avoid replacing an otherwise valid character split at the byte limit.
+            if truncated
+                && let Err(error) = std::str::from_utf8(&body)
+                && error.error_len().is_none()
+            {
+                body.truncate(error.valid_up_to());
+            }
+            let mut body = String::from_utf8_lossy(&body).into_owned();
+            if truncated {
+                body.push_str("\n[Provider error body truncated at 16 KiB]");
+            }
+            return Err(Error::Provider {
+                status: status.as_u16(),
+                body,
+            });
+        }
 
         if response
             .content_length()
@@ -209,9 +305,7 @@ impl ChatProvider {
             }
             body.extend_from_slice(&chunk);
         }
-        let raw = serde_json::from_slice::<Value>(&body)?;
-
-        self.parse_response(raw)
+        Ok(serde_json::from_slice::<Value>(&body)?)
     }
 
     fn headers(&self) -> Result<HeaderMap> {
@@ -338,6 +432,71 @@ mod tests {
             response.reasoning.unwrap().reasoning_content,
             Some("worked it out".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn provider_errors_preserve_status_and_json_or_plain_text_bodies() {
+        for (status, body) in [
+            (400, r#"{"error":{"message":"Invalid model","code":400}}"#),
+            (429, r#"{"error":{"message":"Rate limited"}}"#),
+            (502, "upstream unavailable"),
+            (503, ""),
+        ] {
+            let server = MockServer::start();
+            let mock = server.mock(|when, then| {
+                when.method(POST).path("/v1/chat/completions");
+                then.status(status).body(body);
+            });
+            let provider =
+                ChatProvider::new(ProviderConfig::llama_cpp(server.base_url(), "model").unwrap());
+            let error = provider.send_messages(&[]).await.unwrap_err();
+            assert!(error.to_string().contains(&status.to_string()));
+            assert!(
+                matches!(error, Error::Provider { status: actual, body: actual_body }
+                if actual == status && actual_body == body)
+            );
+            mock.assert();
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_error_bodies_are_bounded_without_splitting_utf8() {
+        for body in [
+            "x".repeat(MAX_ERROR_BODY_BYTES),
+            format!(
+                "{}é{}",
+                "x".repeat(MAX_ERROR_BODY_BYTES - 1),
+                "z".repeat(100_000)
+            ),
+        ] {
+            let server = MockServer::start();
+            let mock = server.mock(|when, then| {
+                when.method(POST);
+                then.status(500).body(&body);
+            });
+            let provider =
+                ChatProvider::new(ProviderConfig::llama_cpp(server.base_url(), "model").unwrap());
+            let Error::Provider {
+                status,
+                body: actual,
+            } = provider.send_messages(&[]).await.unwrap_err()
+            else {
+                panic!("expected provider error");
+            };
+            assert_eq!(status, 500);
+            if body.len() == MAX_ERROR_BODY_BYTES {
+                assert_eq!(actual, body);
+            } else {
+                assert_eq!(
+                    actual,
+                    format!(
+                        "{}\n[Provider error body truncated at 16 KiB]",
+                        "x".repeat(MAX_ERROR_BODY_BYTES - 1)
+                    )
+                );
+            }
+            mock.assert();
+        }
     }
 
     #[tokio::test]

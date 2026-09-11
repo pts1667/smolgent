@@ -7,15 +7,25 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::chat::{ChatMessage, MessageRole, ToolCall};
+use crate::chat::{ChatMessage, MessageContent, MessageRole, ToolCall};
 use crate::{Error, Result};
 
 pub mod builtin;
 pub mod compact;
 pub mod file;
+pub mod media;
 
 /// Async handler result type used by [`Tool`].
 pub type ToolFuture = Pin<Box<dyn Future<Output = Result<Value>> + Send>>;
+
+/// Async handler for tools that return text or actual multimodal content parts.
+pub type ToolContentFuture = Pin<Box<dyn Future<Output = Result<MessageContent>> + Send>>;
+
+#[derive(Clone)]
+enum ToolHandler {
+    Json(Arc<dyn Fn(Value) -> ToolFuture + Send + Sync>),
+    Content(Arc<dyn Fn(Value) -> ToolContentFuture + Send + Sync>),
+}
 
 /// OpenAI-compatible function tool definition.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -70,7 +80,7 @@ pub struct FunctionToolDefinition {
 #[derive(Clone)]
 pub struct Tool {
     definition: ToolDefinition,
-    handler: Arc<dyn Fn(Value) -> ToolFuture + Send + Sync>,
+    handler: ToolHandler,
 }
 
 impl Tool {
@@ -81,7 +91,18 @@ impl Tool {
     {
         Self {
             definition,
-            handler: Arc::new(handler),
+            handler: ToolHandler::Json(Arc::new(handler)),
+        }
+    }
+
+    /// Create a tool whose result preserves multimodal content without JSON stringification.
+    pub fn new_multimodal<F>(definition: ToolDefinition, handler: F) -> Self
+    where
+        F: Fn(Value) -> ToolContentFuture + Send + Sync + 'static,
+    {
+        Self {
+            definition,
+            handler: ToolHandler::Content(Arc::new(handler)),
         }
     }
 
@@ -95,9 +116,23 @@ impl Tool {
         self.definition.name()
     }
 
-    /// Call the tool handler with decoded JSON arguments.
+    /// Call the tool handler with decoded JSON arguments. Multimodal results serialize
+    /// as a string or content array. Use [`Self::call_content`] for typed content.
     pub async fn call(&self, arguments: Value) -> Result<Value> {
-        (self.handler)(arguments).await
+        match &self.handler {
+            ToolHandler::Json(handler) => handler(arguments).await,
+            ToolHandler::Content(handler) => Ok(serde_json::to_value(handler(arguments).await?)?),
+        }
+    }
+
+    /// Execute a tool for replay to the model. Ordinary JSON tools still return JSON text.
+    pub async fn call_content(&self, arguments: Value) -> Result<MessageContent> {
+        match &self.handler {
+            ToolHandler::Json(handler) => {
+                Ok(stringify_tool_output(handler(arguments).await?).into())
+            }
+            ToolHandler::Content(handler) => handler(arguments).await,
+        }
     }
 }
 
@@ -108,8 +143,8 @@ pub struct ToolResult {
     pub tool_call_id: String,
     /// Tool name.
     pub name: String,
-    /// Tool output sent back to the model.
-    pub content: String,
+    /// Tool output sent back to the model, including media parts from multimodal tools.
+    pub content: MessageContent,
 }
 
 impl ToolResult {
@@ -120,7 +155,8 @@ impl ToolResult {
             name: call.function.name.clone(),
             content: format!(
                 "Tool error: {error}\nPlease correct the tool call arguments and try again."
-            ),
+            )
+            .into(),
         }
     }
 
@@ -129,6 +165,7 @@ impl ToolResult {
         ChatMessage {
             role: MessageRole::Tool,
             content: self.content,
+            annotations: Vec::new(),
             reasoning: None,
             reasoning_content: None,
             reasoning_details: None,
@@ -181,12 +218,12 @@ impl ToolRegistry {
             .get(&call.function.name)
             .ok_or_else(|| Error::UnknownTool(call.function.name.clone()))?;
         let arguments = parse_tool_arguments(&call.function.arguments)?;
-        let output = tool.call(arguments).await?;
+        let output = tool.call_content(arguments).await?;
 
         Ok(ToolResult {
             tool_call_id: call.id.clone(),
             name: call.function.name.clone(),
-            content: stringify_tool_output(output),
+            content: output,
         })
     }
 
@@ -298,6 +335,7 @@ mod tests {
         assert!(
             result
                 .content
+                .text()
                 .contains("Tool error: unknown tool 'missing'")
         );
         assert_eq!(message.tool_call_id.as_deref(), Some("call_1"));

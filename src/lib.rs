@@ -144,6 +144,7 @@
 //!
 //! - `cargo run --example openrouter_keyring_setup -- check`
 //! - `cargo run --example openrouter_chat`
+//! - `cargo run --example openrouter_multimodal -- <image-or-video-path> <mime-type>`
 //! - `cargo run --example llama_cpp_chat`
 //! - `cargo run --example tool_registry`
 //! - `cargo run --example telemetry`
@@ -153,6 +154,8 @@ extern crate self as smolgent;
 
 /// Chat-completions request, response, message, reasoning, and tool-call types.
 pub mod chat;
+/// Multimodal content parts and helpers for encoding local media bytes.
+pub mod content;
 /// Crate-wide error and result types.
 pub mod error;
 /// OpenAI-compatible provider configuration and HTTP transport.
@@ -170,8 +173,11 @@ pub use chat::{
     ChatMessage, ChatRequest, ChatResponse, MessageRole, ReasoningConfig, ReasoningPayload,
     ToolCall, ToolCallFunction,
 };
+pub use content::{
+    ContentPart, FileInput, ImageDetail, ImageUrl, InputAudio, MessageContent, VideoUrl,
+};
 pub use error::{Error, Result};
-pub use provider::{ApiKeyRef, ChatProvider, ProviderConfig, ProviderKind};
+pub use provider::{ApiKeyRef, ChatProvider, ModelCapabilities, ProviderConfig, ProviderKind};
 pub use secrets::{KeyringCoreSecretStore, SecretStore, native_credential_store};
 pub use session::{
     AgentEvent, AgentEventReceiver, ChatSession, CompactionConfig, ContextUsage,
@@ -182,6 +188,9 @@ pub use state::AgentState;
 pub use tools::builtin::{
     ApplyPatchArgs, CreateFileArgs, DeleteFileArgs, ReadArgs, RgArgs, apply_patch_tool,
     builtin_registry, create_file_tool, delete_file_tool, read_tool, ripgrep_tool,
+};
+pub use tools::media::{
+    READ_MAX_MEDIA_BYTES, builtin_registry_for_provider, read_tool_with_capabilities,
 };
 pub use tools::{FunctionToolDefinition, Tool, ToolDefinition, ToolRegistry, ToolResult};
 
