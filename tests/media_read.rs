@@ -84,7 +84,9 @@ async fn unknown_or_missing_metadata_and_other_providers_keep_text_reader() {
             .is_none()
     );
     not_found.assert();
-    let local = ChatProvider::new(ProviderConfig::llama_cpp(server.base_url(), "model").unwrap());
+    let mut local_config = ProviderConfig::llama_cpp(server.base_url(), "model").unwrap();
+    local_config.kind = smolgent::ProviderKind::OpenAiCompatible;
+    let local = ChatProvider::new(local_config);
     assert!(local.model_capabilities().await.unwrap().is_none());
     let mut config = openrouter(&server).config().clone();
     config.default_model = "openrouter/auto".into();

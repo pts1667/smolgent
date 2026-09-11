@@ -5,8 +5,8 @@ use std::path::Path;
 
 use super::file::{ReadArgs, ensure_can_read, read_tool, tool_path};
 use crate::{
-    AgentState, ChatProvider, ContentPart, Error, MessageContent, ModelCapabilities, Result, Tool,
-    ToolRegistry,
+    AgentState, ChatProvider, ContentPart, Error, MessageContent, ModelCapabilities, ProviderKind,
+    Result, Tool, ToolRegistry,
 };
 
 /// Maximum size of a local media file before base64 encoding (20 MiB).
@@ -18,16 +18,33 @@ pub const READ_MAX_MEDIA_BYTES: usize = 20 * 1024 * 1024;
 /// Common media formats are recognized by filename extension. Text retains its existing
 /// pagination and limits. Media is returned whole, as content parts, and cannot be paginated.
 /// Root permissions and the media size limit apply before any content is returned.
+/// This uses OpenRouter's format set. Use [`builtin_registry_for_provider`] to also
+/// apply llama.cpp's narrower decoder format support.
 pub fn read_tool_with_capabilities(state: AgentState, capabilities: ModelCapabilities) -> Tool {
+    media_reader(state, capabilities, false)
+}
+
+fn media_reader(state: AgentState, capabilities: ModelCapabilities, llama_cpp: bool) -> Tool {
     let text_reader = read_tool(state.clone());
     let mut definition = text_reader.definition().clone();
     let mut formats = Vec::new();
     for (modality, description) in [
-        ("image", "images: .png, .jpg, .jpeg, .webp, .gif"),
+        (
+            "image",
+            if llama_cpp {
+                "images: .png, .jpg, .jpeg, .gif, .bmp, .tga"
+            } else {
+                "images: .png, .jpg, .jpeg, .webp, .gif"
+            },
+        ),
         ("video", "videos: .mp4, .mpeg, .mpg, .mov, .webm"),
         (
             "audio",
-            "audio: .wav, .mp3, .aiff, .aif, .aac, .ogg, .flac, .m4a",
+            if llama_cpp {
+                "audio: .wav, .mp3, .flac"
+            } else {
+                "audio: .wav, .mp3, .aiff, .aif, .aac, .ogg, .flac, .m4a"
+            },
         ),
         ("file", "PDF documents: .pdf"),
     ] {
@@ -56,6 +73,16 @@ pub fn read_tool_with_capabilities(state: AgentState, capabilities: ModelCapabil
                 return Err(Error::Tool(format!(
                     "model '{}' does not advertise {modality} input support",
                     capabilities.model
+                )));
+            }
+            if llama_cpp
+                && matches!(
+                    format,
+                    "image/webp" | "aiff" | "aac" | "ogg" | "m4a" | "application/pdf"
+                )
+            {
+                return Err(Error::Tool(format!(
+                    "llama.cpp's built-in media decoders do not support {format}; convert the file to a supported format"
                 )));
             }
             if args.character_offset.is_some()
@@ -116,7 +143,11 @@ pub async fn builtin_registry_for_provider(
     let capabilities = provider.model_capabilities().await?;
     let mut registry = super::builtin::builtin_registry(state.clone());
     if let Some(capabilities) = capabilities {
-        registry.insert(read_tool_with_capabilities(state, capabilities));
+        registry.insert(media_reader(
+            state,
+            capabilities,
+            provider.config().kind == ProviderKind::LlamaCpp,
+        ));
     }
     Ok(registry)
 }
@@ -134,6 +165,8 @@ fn media_format(path: &Path) -> Option<(&'static str, &'static str)> {
             "jpg" | "jpeg" => ("image", "image/jpeg"),
             "webp" => ("image", "image/webp"),
             "gif" => ("image", "image/gif"),
+            "bmp" => ("image", "image/bmp"),
+            "tga" => ("image", "image/x-tga"),
             "mp4" => ("video", "video/mp4"),
             "mpeg" | "mpg" => ("video", "video/mpeg"),
             "mov" => ("video", "video/mov"),

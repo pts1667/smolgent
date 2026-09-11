@@ -11,7 +11,7 @@ use crate::chat::{
 };
 use crate::secrets::SecretStore;
 use crate::tools::ToolDefinition;
-use crate::{Error, Result};
+use crate::{ContentPart, Error, MessageContent, Result};
 
 const MAX_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
 const MAX_ERROR_BODY_BYTES: usize = 16 * 1024;
@@ -114,12 +114,19 @@ impl ProviderConfig {
     /// llama.cpp server configuration.
     ///
     /// The base URL should be the server root, for example `http://127.0.0.1:8080`.
+    /// An optional reverse-proxy/API path prefix is preserved (with or without a trailing slash).
     pub fn llama_cpp(base_url: impl AsRef<str>, model: impl Into<String>) -> Result<Self> {
-        let base = Url::parse(base_url.as_ref())?;
+        let mut base = Url::parse(base_url.as_ref())?;
+        base.path_segments_mut()
+            .map_err(|_| Error::Tool("provider URL cannot contain endpoint paths".into()))?
+            .pop_if_empty()
+            .extend(["v1", "chat", "completions"]);
+        base.set_query(None);
+        base.set_fragment(None);
         Ok(Self {
             name: "llama-cpp".to_string(),
             kind: ProviderKind::LlamaCpp,
-            chat_completions_url: base.join("/v1/chat/completions")?,
+            chat_completions_url: base,
             api_key: ApiKeyRef::None,
             default_model: model.into(),
             headers: Vec::new(),
@@ -163,14 +170,60 @@ impl ChatProvider {
         &self.config
     }
 
-    /// Look up the configured OpenRouter model's input modalities.
+    /// Look up the configured model's input modalities on OpenRouter or llama.cpp.
     ///
-    /// Returns `None` for other providers, automatic routing, unknown model IDs, or missing
+    /// llama.cpp uses `/props?model=...`; vision, audio, and video are enabled only when
+    /// explicitly advertised. Older servers without metadata return `None`.
+    /// Returns `None` for generic providers, automatic routing, unknown model IDs, or missing
     /// modality metadata. Known aliases and variant suffixes are resolved by OpenRouter.
     /// Fetch once when constructing tools; rebuild them if the application's model changes.
     pub async fn model_capabilities(&self) -> Result<Option<ModelCapabilities>> {
+        match self.config.kind {
+            ProviderKind::LlamaCpp => self.llama_cpp_capabilities().await,
+            ProviderKind::OpenRouter => self.openrouter_capabilities().await,
+            ProviderKind::OpenAiCompatible => Ok(None),
+        }
+    }
+
+    async fn llama_cpp_capabilities(&self) -> Result<Option<ModelCapabilities>> {
+        let mut url = self.config.chat_completions_url.join("../../props")?;
+        url.query_pairs_mut()
+            .append_pair("model", &self.config.default_model);
+        let Some(raw) = self.fetch_model_metadata(url).await? else {
+            return Ok(None);
+        };
+        let Some(modalities) = raw.get("modalities").filter(|value| !value.is_null()) else {
+            return Ok(None);
+        };
+        #[derive(Deserialize)]
+        struct Modalities {
+            #[serde(default)]
+            vision: bool,
+            #[serde(default)]
+            audio: bool,
+            #[serde(default)]
+            video: bool,
+        }
+        let modalities: Modalities = serde_json::from_value(modalities.clone())?;
+        let mut inputs = vec!["text".to_string()];
+        for (enabled, name) in [
+            (modalities.vision, "image"),
+            (modalities.audio, "audio"),
+            (modalities.video, "video"),
+        ] {
+            if enabled {
+                inputs.push(name.into());
+            }
+        }
+        Ok(Some(ModelCapabilities {
+            model: self.config.default_model.clone(),
+            input_modalities: inputs,
+        }))
+    }
+
+    async fn openrouter_capabilities(&self) -> Result<Option<ModelCapabilities>> {
         let model = &self.config.default_model;
-        if self.config.kind != ProviderKind::OpenRouter || model == "openrouter/auto" {
+        if model == "openrouter/auto" {
             return Ok(None);
         }
         let segments = model.split('/').collect::<Vec<_>>();
@@ -186,17 +239,9 @@ impl ChatProvider {
             .map_err(|_| Error::Tool("provider URL cannot contain model paths".into()))?
             .pop_if_empty()
             .extend(segments);
-        let response = self
-            .client
-            .get(url)
-            .headers(self.headers()?)
-            .timeout(std::time::Duration::from_secs(15))
-            .send()
-            .await?;
-        if response.status() == reqwest::StatusCode::NOT_FOUND {
+        let Some(raw) = self.fetch_model_metadata(url).await? else {
             return Ok(None);
-        }
-        let raw = Self::read_response_json(response).await?;
+        };
         let Some(modalities) = raw.pointer("/data/architecture/input_modalities") else {
             return Ok(None);
         };
@@ -207,6 +252,20 @@ impl ChatProvider {
             model: model.clone(),
             input_modalities: serde_json::from_value(modalities.clone())?,
         }))
+    }
+
+    async fn fetch_model_metadata(&self, url: Url) -> Result<Option<Value>> {
+        let response = self
+            .client
+            .get(url)
+            .headers(self.headers()?)
+            .timeout(std::time::Duration::from_secs(15))
+            .send()
+            .await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        Ok(Some(Self::read_response_json(response).await?))
     }
 
     /// Send messages without tools.
@@ -243,14 +302,39 @@ impl ChatProvider {
     }
 
     /// Send a pre-built request and parse the response.
+    /// llama.cpp video parts are translated to `input_video` at the HTTP boundary;
+    /// the request and session content types remain provider-independent.
     pub async fn send_request(&self, request: ChatRequest) -> Result<ChatResponse> {
-        let response = self
+        let builder = self
             .client
             .post(self.config.chat_completions_url.clone())
-            .headers(self.headers()?)
-            .json(&request)
-            .send()
-            .await?;
+            .headers(self.headers()?);
+        let needs_video_conversion = self.config.kind == ProviderKind::LlamaCpp
+            && request.messages.iter().any(|message| {
+                matches!(&message.content, MessageContent::Parts(parts)
+                    if parts.iter().any(|part| matches!(part, ContentPart::VideoUrl { .. })))
+            });
+        let builder = if needs_video_conversion {
+            let mut body = serde_json::to_value(&request)?;
+            // Transform only typed message content, including tool results. Do not touch
+            // tool arguments/schemas or other JSON that happens to contain similar keys.
+            if let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) {
+                for message in messages {
+                    if let Some(parts) = message.get_mut("content").and_then(Value::as_array_mut) {
+                        for part in parts {
+                            if part["type"] == "video_url" {
+                                let url = part["video_url"]["url"].take();
+                                *part = json!({"type": "input_video", "input_video": {"url": url}});
+                            }
+                        }
+                    }
+                }
+            }
+            builder.json(&body)
+        } else {
+            builder.json(&request)
+        };
+        let response = builder.send().await?;
 
         self.parse_response(Self::read_response_json(response).await?)
     }

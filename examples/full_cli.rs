@@ -28,6 +28,7 @@ const MODEL: &str = "deepseek/deepseek-v4.1-flash";
  * Example of a full CLI app for using smolgent.
  * Some notes:
  *  1. OPENROUTER_API_KEY is fetched from environment variables, but you should really be using the keyring store.
+ *     Set SMOLGENT_PROVIDER=llama-cpp to use LLAMA_CPP_BASE_URL/MODEL and optional LLAMA_CPP_API_KEY instead.
  *  2. The TUI is kinda crap, for example you can't really scroll "all the way" and there are issues with the input box. Polish isn't really the point
  *  */
 
@@ -36,11 +37,10 @@ async fn main() -> smolgent::Result<()> {
     dotenvy::dotenv().ok();
     let args = CliArgs::parse(env::args().skip(1))?;
     let input_dir = args.input_dir.canonicalize()?;
-    let api_key = env::var("OPENROUTER_API_KEY")
-        .map_err(|_| Error::Tool("OPENROUTER_API_KEY is missing from .env/environment".into()))?;
+    let provider = configured_provider()?;
 
     let app = TerminalGuard::enter()?;
-    let result = run_app(app.terminal, input_dir, args.read_only, api_key).await;
+    let result = run_app(app.terminal, input_dir, args.read_only, provider).await;
     TerminalGuard::leave()?;
     result
 }
@@ -49,7 +49,7 @@ async fn run_app(
     mut terminal: Terminal<CrosstermBackend<Stdout>>,
     input_dir: PathBuf,
     read_only: bool,
-    api_key: String,
+    provider: ChatProvider,
 ) -> smolgent::Result<()> {
     let state = if read_only {
         AgentState::new([input_dir.clone()], [])
@@ -57,7 +57,6 @@ async fn run_app(
         AgentState::new([input_dir.clone()], [input_dir.clone()])
     };
     let display_input_dir = user_facing_path(&input_dir);
-    let provider = openrouter_provider(api_key)?;
     let (registry, discovery_error) =
         match builtin_registry_for_provider(state.clone(), &provider).await {
             Ok(registry) => (registry, None),
@@ -204,7 +203,30 @@ fn spawn_agent_status_thread(events: AgentEventReceiver) -> Receiver<String> {
     receiver
 }
 
-fn openrouter_provider(api_key: String) -> smolgent::Result<ChatProvider> {
+fn configured_provider() -> smolgent::Result<ChatProvider> {
+    match env::var("SMOLGENT_PROVIDER")
+        .as_deref()
+        .unwrap_or("openrouter")
+    {
+        "llama-cpp" => {
+            let base =
+                env::var("LLAMA_CPP_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".into());
+            let model = env::var("LLAMA_CPP_MODEL").unwrap_or_else(|_| "local-model".into());
+            let mut config = ProviderConfig::llama_cpp(base, model)?;
+            if let Ok(key) = env::var("LLAMA_CPP_API_KEY") {
+                config.api_key = ApiKeyRef::Literal(key);
+            }
+            return Ok(ChatProvider::new(config));
+        }
+        "openrouter" => {}
+        other => {
+            return Err(Error::Tool(format!(
+                "unknown SMOLGENT_PROVIDER '{other}'; use openrouter or llama-cpp"
+            )));
+        }
+    }
+    let api_key = env::var("OPENROUTER_API_KEY")
+        .map_err(|_| Error::Tool("OPENROUTER_API_KEY is missing from .env/environment".into()))?;
     let model = env::var("OPENROUTER_MODEL").unwrap_or_else(|_| MODEL.to_string());
     let mut config = ProviderConfig::openrouter(model)?;
     config.api_key = ApiKeyRef::Literal(api_key);

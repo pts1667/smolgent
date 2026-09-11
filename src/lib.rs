@@ -64,6 +64,8 @@
 //! `examples/full_cli.rs` shows a fuller interactive CLI agent. `examples/telemetry.rs`
 //! demonstrates telemetry without requiring a real API key, and `examples/openrouter_chat.rs`
 //! demonstrates a minimal OpenRouter request.
+//! `examples/llama_cpp_multimodal.rs` discovers a local server's media capabilities and
+//! sends images, audio, or video using the same content API.
 //!
 //! ## Events And Telemetry
 //!

@@ -57,7 +57,7 @@ Configure `SessionConfig::telemetry` with `TelemetryConfig::messages()`, `Teleme
 Payload capture is disabled unless you choose `TelemetryConfig::all()` or otherwise enable the payload flags.
 It is the responsibility of the user to actually log the provided content; the library only emits events.
 
-## Multimodal Input (OpenRouter)
+## Multimodal Input
 
 Pass an ordered `Vec<ContentPart>` wherever you would pass a user message. It works with direct provider requests, `ChatSession::send_user_message`, and `ChatSession::run_user_message_with_tools`.
 
@@ -82,7 +82,7 @@ Following [OpenRouter's multimodal documentation](https://openrouter.ai/docs/gui
 
 Byte helpers encode data in memory; the application reads files and chooses MIME types/formats. Audio requires raw base64 rather than a URL. Image, PDF, and video byte helpers produce base64 data URLs. Multiple attachments and text parts retain their order. Image detail can be set through `ContentPart::ImageUrl` and `ImageDetail`.
 
-Choose a model that supports the requested modalities. Video URL and media format support depend on the upstream provider/model. OpenRouter handles PDF parsing with its default configuration. Returned PDF annotations and reasoning are preserved in session history for follow-up requests. These input formats are tested against OpenRouter's wire protocol; support at other compatible endpoints depends on their capabilities. Media generation and dedicated speech endpoints are outside this input API.
+Choose a model that supports the requested modalities. Video URL and media format support depend on the upstream provider/model. OpenRouter handles PDF parsing with its default configuration. Returned PDF annotations and reasoning are preserved in session history for follow-up requests. OpenRouter and llama.cpp input formats are covered by HTTP mock tests; support at other compatible endpoints depends on their capabilities. Media generation and dedicated speech endpoints are outside this input API.
 
 The image/video example uses `z-ai/glm-5.3-flash` on OpenRouter and the same keyring entry as `openrouter_chat`. Pass one or more local paths, each followed by its MIME type:
 
@@ -94,15 +94,33 @@ cargo run --example openrouter_multimodal -- --prompt "Does this image appear in
 
 It encodes media as base64 data URLs and sends the prompt and attachments in one message. Use `--help` for usage. This example selects the model explicitly; `OPENROUTER_MODEL` does not override it.
 
+### llama.cpp
+
+Use the same `ContentPart` constructors with `ProviderConfig::llama_cpp(base_url, model)`. Images and audio use their existing wire formats; the provider converts video parts to llama.cpp's `input_video` format when sending a request, including media in tool results. Session history retains the original parts. llama.cpp does not provide OpenRouter's PDF parsing.
+
+Start a [multimodal llama-server](https://github.com/ggml-org/llama.cpp/blob/master/docs/multimodal.md) with a supported model and its matching projector, for example `llama-server -m model.gguf --mmproj mmproj.gguf --alias local-model --port 8080`. According to the [server API documentation](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md), image decoding supports PNG/JPEG/GIF/BMP/TGA, and audio decoding supports WAV/MP3/FLAC. WebP is not supported by the standard image decoder; convert it to PNG or JPEG first. Video requires a recent server with video support and FFmpeg/ffprobe available on the server.
+
+The example discovers capabilities and uses the bounded media reader to attach one or more files. File extensions select formats:
+
+```powershell
+$env:LLAMA_CPP_BASE_URL = "http://127.0.0.1:8080"
+$env:LLAMA_CPP_MODEL = "local-model"
+cargo run --example llama_cpp_multimodal -- ./image.png
+cargo run --example llama_cpp_multimodal -- --prompt "Summarize this clip" ./clip.mp4
+cargo run --example llama_cpp_multimodal -- --prompt "Transcribe this" ./sound.wav
+```
+
+Set `LLAMA_CPP_API_KEY` if the server requires authentication. Local bytes are embedded in the request, so the server does not need access to the client's filesystem. The server root may include a reverse-proxy/API path prefix; do not append `/v1`.
+
 `ChatMessage::content` and `SessionTurn::content` now use `MessageContent` (`Text` or `Parts`) instead of `String`. Existing string constructors and text-only JSON stay the same. Use `.content.text()` to read text, `.content.to_string()` for an owned display string, or match `MessageContent::Parts` to inspect attachments. Struct literals need `content: text.into()` and `annotations: Vec::new()`. Display and message telemetry include text only; full media payloads are included in model telemetry only when `model_payloads` is enabled.
 
 ## Model-aware Read Tool
 
-Use `builtin_registry_for_provider(state, &provider).await?` instead of `builtin_registry(state)` to enable model-aware reading. It looks up the configured OpenRouter model through the [model metadata endpoint](https://openrouter.ai/docs/api/api-reference/models/get-a-model-by-its-slug) and uses `architecture.input_modalities` to extend the `read` description and handler. The registry captures capabilities once; rebuild it when switching models.
+Use `builtin_registry_for_provider(state, &provider).await?` instead of `builtin_registry(state)` to enable model-aware reading. For OpenRouter it uses the [model metadata endpoint](https://openrouter.ai/docs/api/api-reference/models/get-a-model-by-its-slug) and `architecture.input_modalities`. For llama.cpp it queries `/props?model=<configured-model>` and maps `modalities.vision`, `modalities.audio`, and `modalities.video` to supported inputs. Video is enabled only when explicitly advertised; vision alone does not imply video support. The model query also supports llama.cpp's model router (which may load the selected model). The registry captures capabilities once; rebuild it when switching models or reloading the server.
 
 Supported inputs enable matching local file types: images, video, audio, and PDFs when `file` input is advertised. Media reads infer the format from the extension, enforce allowed read roots, and attach the complete file as content parts. Each media file is capped at 20 MiB before encoding; text offsets/counts are rejected for media. Text reading keeps its existing pagination and limits. Upstream model limits can be lower.
 
-Unknown models, automatic routing (`openrouter/auto`), missing metadata, and other providers retain the text-only reader. Discovery errors are returned to the application. `full_cli` reports these errors and falls back to text-only reading, so a failed lookup does not block normal text use.
+Unknown models, automatic routing (`openrouter/auto`), missing metadata (including older llama.cpp servers), and generic compatible providers retain the text-only reader. Discovery errors are returned to the application. `full_cli` reports these errors and falls back to text-only reading, so a failed lookup does not block normal text use.
 
 For example, with `OPENROUTER_API_KEY` configured in the environment or `.env`:
 
@@ -112,5 +130,16 @@ cargo run --release --example full_cli -- ./media --read-only
 ```
 
 Then ask the agent to read and compare files such as `image.png` and `clip.mp4` in that directory. The CLI discovers capabilities at startup. You can also query `provider.model_capabilities().await?` directly or construct `read_tool_with_capabilities(state, capabilities)` with a previously fetched snapshot.
+
+To use the same CLI with llama.cpp, select the provider explicitly (OpenRouter remains the default):
+
+```powershell
+$env:SMOLGENT_PROVIDER = "llama-cpp"
+$env:LLAMA_CPP_BASE_URL = "http://127.0.0.1:8080"
+$env:LLAMA_CPP_MODEL = "local-model"
+cargo run --release --example full_cli -- ./media --read-only
+```
+
+This mode requires no OpenRouter key. The provider-aware registry also restricts the reader to llama.cpp's decoder formats. The lower-level `read_tool_with_capabilities` helper uses OpenRouter's format set because its capability snapshot contains modalities only.
 
 `ToolResult::content` now also uses `MessageContent`; use `.text()` or `.to_string()` when consuming its text. Custom media tools use `Tool::new_multimodal` and return `MessageContent`. Existing `Tool::new` handlers and macro-generated tools keep their JSON-to-text behavior, so ordinary JSON arrays are never mistaken for media. Tool telemetry exposes text only; full attachments are available through model payload telemetry.

@@ -1,4 +1,5 @@
 //! Ordered chat content using OpenRouter's chat-completions wire format.
+//! Providers adapt content at the HTTP boundary when needed (llama.cpp uses `input_video`).
 
 use std::{borrow::Cow, fmt};
 
