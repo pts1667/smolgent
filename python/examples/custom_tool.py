@@ -9,5 +9,5 @@ def add(a: int, b: int) -> int:
     return a + b
 
 
-agent = Agent.openrouter("openrouter/auto", tools=[add])
+agent = Agent.openrouter("deepseek/deepseek-v4.1-flash", tools=[add])
 print(agent.run("Use add to calculate 12345 + 67890."))

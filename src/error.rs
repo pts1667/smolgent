@@ -3,7 +3,7 @@ pub enum Error {
     #[error("keyring error: {0}")]
     Keyring(#[from] keyring_core::Error),
 
-    #[error("http error: {0}")]
+    #[error("http error: {}", http_error_message(.0))]
     Http(#[from] reqwest::Error),
 
     /// An unsuccessful HTTP response. The body is limited to a 16 KiB prefix
@@ -52,3 +52,22 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+// reqwest's Display omits its source chain: a body-read timeout otherwise looks
+// like a JSON decoding failure. Preserve the cause for Rust and Python callers.
+fn http_error_message(error: &reqwest::Error) -> String {
+    use std::error::Error as _;
+    use std::fmt::Write as _;
+
+    let mut message = if error.is_timeout() {
+        format!("request timed out ({error})")
+    } else {
+        error.to_string()
+    };
+    let mut source = error.source();
+    while let Some(cause) = source {
+        let _ = write!(message, ": {cause}");
+        source = cause.source();
+    }
+    message
+}

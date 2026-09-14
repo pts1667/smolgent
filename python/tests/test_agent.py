@@ -28,7 +28,7 @@ def call(name, arguments, call_id="call_1"):
 
 
 @contextmanager
-def server(*responses):
+def server(*responses, body_delay=0):
     pending = queue.Queue()
     for response in responses:
         pending.put(response)
@@ -46,11 +46,20 @@ def server(*responses):
                 response = response(body)
             status, body = response if isinstance(response, tuple) else (200, response)
             payload = json.dumps(body).encode()
+            if body_delay:
+                payload = b"\n" + payload
             try:
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(payload)))
                 self.end_headers()
+                if body_delay:
+                    # Simulate a provider sending keep-alive whitespace while
+                    # generating its non-streaming completion.
+                    self.wfile.write(payload[:1])
+                    self.wfile.flush()
+                    threading.Event().wait(body_delay)
+                    payload = payload[1:]
                 self.wfile.write(payload)
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                 pass  # Expected when the caller cancels an in-flight request.
@@ -212,11 +221,24 @@ class AgentTests(unittest.TestCase):
             agent = local_agent(url, timeout=0.1)
             initial = agent.messages
             try:
-                with self.assertRaises(SmolgentError):
+                with self.assertRaisesRegex(SmolgentError, "timed out"):
                     agent.run("Wait")
                 self.assertEqual(agent.messages, initial)
             finally:
                 release.set()
+
+    def test_timeout_during_response_body_reports_cause(self):
+        with server(answer(), body_delay=0.4) as (url, _):
+            agent = local_agent(url, timeout=0.1)
+            initial = agent.messages
+            with self.assertRaisesRegex(SmolgentError, "timed out"):
+                agent.run("Wait for the body")
+            self.assertEqual(agent.messages, initial)
+
+    def test_longer_timeout_accepts_keepalive_before_json(self):
+        with server(answer("Completed"), body_delay=0.1) as (url, _):
+            agent = local_agent(url, timeout=2)
+            self.assertEqual(agent.run("Wait for the body").text, "Completed")
 
     def test_multimodal_and_llama_cpp_path(self):
         content = [{"type": "text", "text": "Describe"},
@@ -232,8 +254,9 @@ class AgentTests(unittest.TestCase):
                     answer(None, tool_calls=[call("missing", {})]), answer("Retry")) as (url, _):
             agent = local_agent(url, max_tool_rounds=0)
             initial = agent.messages
-            with self.assertRaisesRegex(SmolgentError, "401"):
+            with self.assertRaisesRegex(SmolgentError, "401") as raised:
                 agent.run("Fail")
+            self.assertIsNone(raised.exception.__context__)
             self.assertEqual(agent.messages, initial)
             with self.assertRaisesRegex(SmolgentError, "stopped after 0 tool rounds"):
                 agent.run("Fail again")

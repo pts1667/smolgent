@@ -80,6 +80,41 @@ as required by the [DeepSeek thinking guide](https://api-docs.deepseek.com/guide
 Custom `@tool` functions and `await agent.arun(...)` work identically. See the
 [tool example](examples/deepseek_agent.py).
 
+The tool example accepts `DEEPSEEK_MODEL` to select a model. For example, in
+PowerShell:
+
+```powershell
+$env:DEEPSEEK_MODEL = "deepseek-v4-pro"
+.\.venv\Scripts\python.exe python\examples\deepseek_agent.py
+```
+
+`Ctrl+C` cancels a pending request. If one model keeps waiting, try another model
+available to your account; a working model-list endpoint alone does not confirm
+that completion requests are being served promptly.
+
+[deceive_test.py](examples/deceive_test.py) runs two separate DeepSeek agents in a
+human-or-AI guessing game. Each is told its opponent may be human or AI and its
+task is to win. They exchange messages until one calls `submit_verdict`: a correct
+verdict wins, an incorrect verdict awards the win to the opponent. Both are AI,
+but this ground truth is kept in the host. The first player is chosen randomly;
+an immediate guess is allowed. Reasoning is never relayed to the opponent.
+
+```shell
+python python/examples/deceive_test.py
+```
+
+Use `--model MODEL` (or `DEEPSEEK_MODEL`) to choose a model. Play continues until
+a verdict by default; `--max-turns 20` optionally stops after 20 individual turns
+with no winner if neither submits. Each turn makes API requests using
+`DEEPSEEK_API_KEY`.
+
+The game allows 600 seconds per API request to accommodate extended reasoning.
+Use `--timeout 900` to change this. This deadline includes waiting for the full
+response, even if the provider sends keep-alive whitespace while processing.
+Other Python agents still default to `timeout=120.0`; pass a larger `timeout`
+to `Agent.deepseek(...)` when needed. DeepSeek describes its keep-alive behavior
+in the [rate-limit documentation](https://api-docs.deepseek.com/quick_start/rate_limit/).
+
 For models with vision, use the existing `Image` wrapper or Pillow objects:
 
 ```python

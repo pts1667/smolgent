@@ -266,8 +266,12 @@ class Agent:
         try:
             asyncio.get_running_loop()
         except RuntimeError:
-            return asyncio.run(self.arun(prompt))
-        raise RuntimeError("an event loop is running; use 'await agent.arun(prompt)'")
+            pass
+        else:
+            raise RuntimeError("an event loop is running; use 'await agent.arun(prompt)'")
+        # Run outside the except block so provider errors and Ctrl+C do not
+        # acquire the expected "no running event loop" exception as context.
+        return asyncio.run(self.arun(prompt))
 
     @property
     def messages(self) -> list[dict[str, Any]]:
