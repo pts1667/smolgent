@@ -1,5 +1,6 @@
 [workspace]
-members = [".", "smolgent-macros"]
+members = [".", "smolgent-macros", "smolgent-python"]
+default-members = [".", "smolgent-macros"]
 
 [workspace.package]
 version = "0.1.0"

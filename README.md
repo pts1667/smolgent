@@ -12,6 +12,23 @@ If your user doesn't have access to ripgrep, you can just disable the built-in r
 
 ## Examples
 
+### Python
+
+Install from this checkout with `python -m pip install .` (requires Rust to build),
+then set `OPENROUTER_API_KEY`:
+
+```python
+from smolgent import Agent
+agent = Agent.openrouter("openrouter/auto", read_roots=["."])
+print(agent.run("Read README.md and summarize this project in three sentences."))
+```
+
+The same agent retains conversation history. Use `await agent.arun(...)` in async
+applications. See [the Python guide](python/README.md) for custom Python tools,
+keyring credentials, local providers, packaging, and development instructions.
+
+### Rust
+
 See the [full_cli.rs](examples/full_cli.rs) example for a full TUI app exposing the agent harness.
 
 Run the example: `cargo run --release --example full_cli -- . --read-only`

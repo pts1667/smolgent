@@ -1,0 +1,16 @@
+[build-system]
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[project]
+name = "smolgent"
+version = "0.1.0"
+description = "A small Rust-powered tool-calling agent harness for Python"
+readme = "python/README.md"
+requires-python = ">=3.10"
+license = "MIT"
+
+[tool.maturin]
+manifest-path = "smolgent-python/Cargo.toml"
+python-source = "python"
+module-name = "smolgent._native"
