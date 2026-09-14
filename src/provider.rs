@@ -169,6 +169,7 @@ pub struct ChatProvider {
     client: reqwest::Client,
     config: ProviderConfig,
     secrets: Option<Arc<dyn SecretStore>>,
+    stream_events: Option<crate::streaming::Sender>,
 }
 
 impl ChatProvider {
@@ -178,6 +179,7 @@ impl ChatProvider {
             client: reqwest::Client::new(),
             config,
             secrets: None,
+            stream_events: None,
         }
     }
 
@@ -196,6 +198,34 @@ impl ChatProvider {
     /// Provider configuration.
     pub fn config(&self) -> &ProviderConfig {
         &self.config
+    }
+
+    pub(crate) fn with_stream_events(mut self, sender: Option<crate::streaming::Sender>) -> Self {
+        self.stream_events = sender;
+        self
+    }
+
+    pub(crate) async fn stream_event(&self, event: crate::StreamEvent) -> Result<()> {
+        use futures_util::SinkExt;
+        if let Some(sender) = &self.stream_events {
+            sender
+                .clone()
+                .send(event)
+                .await
+                .map_err(|_| Error::Stream("stream consumer closed".into()))?;
+        }
+        Ok(())
+    }
+
+    /// Stream one model request without executing tools. Dropping the stream cancels it.
+    /// The final event contains the assembled response; `raw` is a synthesized completion.
+    pub fn send_request_stream(&self, request: ChatRequest) -> crate::EventStream<'_> {
+        crate::streaming::drive(move |sender| async move {
+            self.clone()
+                .with_stream_events(Some(sender))
+                .send_request(request)
+                .await
+        })
     }
 
     /// Look up the configured model's input modalities on OpenRouter or llama.cpp.
@@ -343,8 +373,8 @@ impl ChatProvider {
                 matches!(&message.content, MessageContent::Parts(parts)
                     if parts.iter().any(|part| matches!(part, ContentPart::VideoUrl { .. })))
             });
-        let builder = if self.config.kind == ProviderKind::DeepSeek {
-            builder.json(&deepseek_request_body(&request)?)
+        let body = if self.config.kind == ProviderKind::DeepSeek {
+            Some(deepseek_request_body(&request)?)
         } else if needs_video_conversion {
             let mut body = serde_json::to_value(&request)?;
             // Transform only typed message content, including tool results. Do not touch
@@ -361,13 +391,67 @@ impl ChatProvider {
                     }
                 }
             }
+            Some(body)
+        } else if self.stream_events.is_some() {
+            Some(serde_json::to_value(&request)?)
+        } else {
+            None
+        };
+        let builder = if let Some(mut body) = body {
+            if self.stream_events.is_some() {
+                body["stream"] = json!(true);
+            }
             builder.json(&body)
         } else {
             builder.json(&request)
         };
+        if self.stream_events.is_some() {
+            self.stream_event(crate::StreamEvent::ModelStarted).await?;
+        }
         let response = builder.send().await?;
 
+        if self.stream_events.is_some() && response.status().is_success() {
+            return self.read_stream(response).await;
+        }
+
         self.parse_response(Self::read_response_json(response).await?)
+    }
+
+    async fn read_stream(&self, mut response: reqwest::Response) -> Result<ChatResponse> {
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if !content_type
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .eq_ignore_ascii_case("text/event-stream")
+        {
+            return Err(Error::Stream(format!(
+                "expected text/event-stream, received {content_type:?}"
+            )));
+        }
+        let mut decoder = crate::streaming::SseDecoder::default();
+        let mut accumulator = crate::streaming::Accumulator::default();
+        while let Some(chunk) = response.chunk().await? {
+            for data in decoder.feed(&chunk)? {
+                if data.trim() == "[DONE]" {
+                    let result = self.parse_response(accumulator.finish()?)?;
+                    self.stream_event(crate::StreamEvent::ModelCompleted {
+                        response: result.clone(),
+                    })
+                    .await?;
+                    return Ok(result);
+                }
+                for event in accumulator.push(serde_json::from_str(&data)?)? {
+                    self.stream_event(event).await?;
+                }
+            }
+        }
+        Err(Error::Stream("connection closed before [DONE]".into()))
     }
 
     async fn read_response_json(mut response: reqwest::Response) -> Result<Value> {

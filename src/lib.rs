@@ -168,6 +168,8 @@ pub mod secrets;
 pub mod session;
 /// Read/write root state used by built-in file tools.
 pub mod state;
+/// Incremental model output and managed agent streams.
+pub mod streaming;
 /// Tool definitions, registries, built-ins, and compaction tool schemas.
 pub mod tools;
 
@@ -187,6 +189,7 @@ pub use session::{
     TelemetryEvent, TelemetryEventReceiver, ToolCallUsage,
 };
 pub use state::AgentState;
+pub use streaming::{EventStream, StreamEvent};
 pub use tools::builtin::{
     ApplyPatchArgs, CreateFileArgs, DeleteFileArgs, ReadArgs, RgArgs, apply_patch_tool,
     builtin_registry, create_file_tool, delete_file_tool, read_tool, ripgrep_tool,

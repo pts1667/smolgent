@@ -34,6 +34,29 @@ See the [full_cli.rs](examples/full_cli.rs) example for a full TUI app exposing 
 Run the example: `cargo run --release --example full_cli -- . --read-only`
 Replace `.` with any directory you wish to read from.
 
+### Streaming (Rust and Python)
+
+Python exposes synchronous `agent.stream(prompt)` and asynchronous
+`agent.astream(prompt)` event iterators:
+
+```python
+from smolgent import Agent
+
+agent = Agent.deepseek("deepseek-flash")  # Set DEEPSEEK_API_KEY.
+for event in agent.stream("Explain why the sky is blue."):
+    if event.type == "text_delta":
+        print(event.text, end="", flush=True)
+```
+
+Rust exposes `ChatProvider::send_request_stream` for a single completion and
+`ChatSession::stream_user_message_with_tools` for the full agent loop. Both return
+an async stream of `Result<StreamEvent>`; tools execute automatically in the session
+stream. The final `Completed` event carries the assembled response.
+
+Runnable examples: [Python](python/examples/streaming_agent.py) and
+[Rust](examples/streaming_chat.rs) (`cargo run --example streaming_chat`). See the
+[Python streaming guide](python/README.md#streaming) for events and cancellation.
+
 ## Providing API Keys
 
 Providing API keys should be done using keyring secrets.

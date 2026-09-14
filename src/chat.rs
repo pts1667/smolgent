@@ -186,7 +186,7 @@ pub struct ChatRequest {
     pub response_format: Option<Value>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ChatResponse {
     pub message: ChatMessage,
     pub reasoning: Option<ReasoningPayload>,

@@ -284,6 +284,80 @@ or call `Image.from_pil` inside its file context manager.
 Runnable examples: [image_tool.py](examples/image_tool.py) generates an image in
 memory; [multimodal_tool.py](examples/multimodal_tool.py) returns a selected file.
 
+## Streaming
+
+Use `stream()` for a blocking iterator or `astream()` for an async iterator. Both
+run the complete Rust agent loop, including custom tools and subsequent model
+requests. Set `DEEPSEEK_API_KEY` for this example (or supply `keyring_id`):
+
+```python
+from smolgent import Agent
+
+agent = Agent.deepseek("deepseek-flash")
+for event in agent.stream("Explain why the sky is blue."):
+    if event.type == "text_delta":
+        print(event.text, end="", flush=True)
+    elif event.type == "completed":
+        response = event.response  # Same Response type as run()/arun().
+```
+
+In notebooks or async applications:
+
+```python
+from contextlib import aclosing
+
+async with aclosing(agent.astream("Tell me more.")) as events:
+    async for event in events:
+        if event.type == "text_delta":
+            print(event.text, end="", flush=True)
+```
+
+| Event type | Payload |
+| --- | --- |
+| `model_started` | A model request is starting. |
+| `text_delta` | `event.text`: assistant text as it arrives. |
+| `reasoning_delta` | `event.text`: reasoning text supplied by the provider, kept separate. |
+| `tool_call_delta` | `event.data["index"]` and `["delta"]`: partial tool-call fields; arguments may be incomplete JSON. |
+| `model_completed` | `event.response`: one assembled model response, before tool execution. |
+| `tool_started` | `event.data["call"]`: the complete tool call. |
+| `tool_result` | `event.data`: `tool_call_id`, `name`, and `content` (text or multimodal parts). Tool failures are returned to the model as ordinary error content. |
+| `completed` | `event.response`: the final answer; session history is committed. |
+
+Text deltas include intermediate assistant messages before tool calls. Use
+`completed.response.text` when you need only the final answer. Streamed
+`response.raw` is an assembled Chat Completions object, not the original SSE
+chunks; it includes usage when the provider supplies it. Reasoning metadata is
+preserved for subsequent tool rounds. Automatic context compaction uses ordinary
+requests and does not appear as assistant text in the stream.
+
+Streaming supports text/reasoning output and tool calls over Chat Completions SSE
+with DeepSeek, OpenRouter, and compatible servers (including llama.cpp). Existing
+multimodal prompts and tool results remain supported according to the model's
+capabilities. Generated audio/video/image output streams are not implemented.
+Keep-alive comments are ignored; they do not require a reply. Protocol references:
+[DeepSeek](https://api-docs.deepseek.com/api/create-chat-completion/) and
+[OpenRouter](https://openrouter.ai/docs/api/reference/streaming).
+
+Errors raise `SmolgentError`, including disconnects before the end marker and
+provider errors delivered inside the stream. Partial output may already have been
+displayed. History is committed only on successful completion; already executed
+tool effects remain. Consume the iterator through `completed`. If stopping early,
+call `close()` on a synchronous stream (or use `contextlib.closing`), or await
+`aclose()` on an async stream (or use `contextlib.aclosing` as above). Cancellation
+also cancels active async Python tools; a synchronous tool already running in a
+thread cannot be forcibly stopped. Event delivery uses bounded queues.
+
+The configured `timeout` remains a total deadline per HTTP request, including
+streaming and consumer delays. Keep-alives do not extend it. Streaming improves
+visibility but does not remove provider queueing time. `run()` and `arun()` retain
+their non-streaming behavior.
+
+Run the [streaming tool example](examples/streaming_agent.py):
+
+```powershell
+.\.venv\Scripts\python.exe python\examples\streaming_agent.py
+```
+
 ## Credentials and other endpoints
 
 Pass `api_key="..."` explicitly, or use the Rust keyring backend with an

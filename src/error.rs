@@ -1,5 +1,7 @@
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("stream error: {0}")]
+    Stream(String),
     #[error("keyring error: {0}")]
     Keyring(#[from] keyring_core::Error),
 

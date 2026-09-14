@@ -9,7 +9,7 @@ import math
 import os
 import re
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Iterable, overload
+from typing import Any, AsyncIterator, Awaitable, Callable, Iterable, Iterator, overload
 
 from ._native import NativeAgent, SmolgentError, set_api_key
 from ._media import (
@@ -18,14 +18,14 @@ from ._media import (
 from ._schema import infer_parameters
 
 __all__ = ["Agent", "Audio", "File", "Image", "MultimodalResult", "Response",
-           "SmolgentError", "Tool", "Video", "set_api_key", "tool"]
+           "SmolgentError", "StreamEvent", "Tool", "Video", "set_api_key", "tool"]
 
 Path = str | os.PathLike[str]
 
 
 @dataclass(frozen=True)
 class Response:
-    """Final answer plus the unmodified provider payload and reasoning metadata."""
+    """Final answer and metadata. Streaming raw payloads are assembled completions."""
 
     text: str
     message: dict[str, Any]
@@ -34,6 +34,37 @@ class Response:
 
     def __str__(self) -> str:
         return self.text
+
+
+@dataclass(frozen=True)
+class StreamEvent:
+    """Incremental output across model/tool rounds; completed carries the final Response.
+
+    Types: model_started, text_delta, reasoning_delta, tool_call_delta,
+    model_completed, tool_started, tool_result, completed.
+    Tool payloads and other event-specific fields are available in data.
+    """
+
+    type: str
+    text: str = ""
+    response: Response | None = None
+    data: dict[str, Any] | None = None
+
+    @classmethod
+    def _decode(cls, payload: str) -> StreamEvent:
+        value = json.loads(payload)
+        result = value.get("response")
+        response = None if result is None else Response(
+            text=_response_text(result["message"]), **result,
+        )
+        return cls(type=value["type"], text=value.get("text", ""), response=response, data=value)
+
+
+def _response_text(message: dict[str, Any]) -> str:
+    content = message.get("content") or ""
+    if isinstance(content, str):
+        return content
+    return "".join(part.get("text", "") for part in content if part.get("type") == "text")
 
 
 @dataclass(frozen=True)
@@ -228,6 +259,10 @@ class Agent:
         The timeout option limits each HTTP request, not the entire agent run.
         Use asyncio.wait_for for an overall deadline.
         """
+        return await self._arun(prompt)
+
+    async def _arun(self, prompt: Content,
+                    on_event: Callable[[str], Awaitable[None]] | None = None) -> Response:
         active_tools: set[asyncio.Task[Any]] = set()
         closed = False
 
@@ -246,10 +281,22 @@ class Agent:
                     active_tools.discard(task)
             return invoke
 
+        async def dispatch(payload: str) -> None:
+            if closed:
+                raise asyncio.CancelledError()
+            task = asyncio.current_task()
+            assert task is not None and on_event is not None
+            active_tools.add(task)
+            try:
+                await on_event(payload)
+            finally:
+                active_tools.discard(task)
+
         try:
             result = await self._native.arun(
                 await asyncio.to_thread(serialize_prompt, prompt),
                 [(item._definition(), adapter(item)) for item in self._tools],
+                dispatch if on_event is not None else None,
             )
             return Response(**json.loads(result))
         finally:
@@ -260,6 +307,74 @@ class Agent:
                 task.cancel()
             if pending:
                 await asyncio.gather(*pending, return_exceptions=True)
+
+    async def astream(self, prompt: Content) -> AsyncIterator[StreamEvent]:
+        """Stream model output and tool events, followed by completed with the final Response.
+
+        Consume to completion to commit history. On early exit, await aclose() or
+        use contextlib.aclosing to cancel promptly. Tool effects cannot be undone.
+        Text deltas include intermediate assistant messages across tool rounds.
+        """
+        queue: asyncio.Queue[tuple[StreamEvent, asyncio.Event]] = asyncio.Queue(maxsize=1)
+
+        async def receive(payload: str) -> None:
+            consumed = asyncio.Event()
+            await queue.put((StreamEvent._decode(payload), consumed))
+            await consumed.wait()
+
+        run = asyncio.create_task(self._arun(prompt, receive))
+        get: asyncio.Task[tuple[StreamEvent, asyncio.Event]] | None = None
+        try:
+            while True:
+                if not queue.empty():
+                    event, consumed = queue.get_nowait()
+                    yield event
+                    consumed.set()
+                    continue
+                if run.done():
+                    yield StreamEvent(type="completed", response=run.result())
+                    break
+                get = asyncio.create_task(queue.get())
+                await asyncio.wait((run, get), return_when=asyncio.FIRST_COMPLETED)
+                if get.done():
+                    event, consumed = get.result()
+                    yield event
+                    consumed.set()
+                else:
+                    get.cancel()
+                    await asyncio.gather(get, return_exceptions=True)
+                get = None
+        finally:
+            if get is not None:
+                get.cancel()
+                await asyncio.gather(get, return_exceptions=True)
+            run.cancel()
+            await asyncio.gather(run, return_exceptions=True)
+
+    def stream(self, prompt: Content) -> Iterator[StreamEvent]:
+        """Blocking stream. Use astream in async apps; close() on early exit."""
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            raise RuntimeError("an event loop is running; use 'async for event in agent.astream(prompt)'")
+        loop = asyncio.new_event_loop()
+        stream = self.astream(prompt)
+        try:
+            while True:
+                try:
+                    event = loop.run_until_complete(anext(stream))
+                except StopAsyncIteration:
+                    break
+                yield event
+        finally:
+            try:
+                loop.run_until_complete(stream.aclose())
+                loop.run_until_complete(loop.shutdown_asyncgens())
+                loop.run_until_complete(loop.shutdown_default_executor())
+            finally:
+                loop.close()
 
     def run(self, prompt: Content) -> Response:
         """Blocking convenience method. In notebooks/async apps, await arun instead."""

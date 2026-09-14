@@ -411,6 +411,38 @@ impl ChatSession {
         self.run_with_tools(provider, registry).await
     }
 
+    /// Stream a managed tool loop, committing history only on successful completion.
+    /// Dropping this stream discards partial history. Already executed tool effects remain.
+    /// Automatic context compaction uses ordinary requests and emits no text deltas.
+    pub fn stream_user_message_with_tools<'a>(
+        &'a mut self,
+        provider: &'a ChatProvider,
+        registry: &'a ToolRegistry,
+        content: impl Into<MessageContent>,
+    ) -> crate::EventStream<'a> {
+        let content = content.into();
+        Box::pin(async_stream::try_stream! {
+            use futures_util::StreamExt;
+            let mut working = self.clone();
+            let mut response = None;
+            {
+                let mut stream = crate::streaming::drive(|sender| async {
+                    let provider = provider.clone().with_stream_events(Some(sender));
+                    working.run_user_message_with_tools(&provider, registry, content).await
+                });
+                while let Some(event) = stream.next().await {
+                    match event? {
+                        crate::StreamEvent::Completed { response: result } => response = Some(result),
+                        event => yield event,
+                    }
+                }
+            }
+            let response = response.ok_or_else(|| Error::Stream("missing final response".into()))?;
+            *self = working;
+            yield crate::StreamEvent::Completed { response };
+        })
+    }
+
     /// Run the managed tool loop from the current session state.
     ///
     /// Built-in compaction tools are offered according to [`CompactionConfig`]. Normal tool rounds
@@ -428,7 +460,8 @@ impl ChatSession {
         loop {
             if !compaction_stalled {
                 compaction_stalled = matches!(
-                    self.maybe_compact(provider).await?,
+                    self.maybe_compact(&provider.clone().with_stream_events(None))
+                        .await?,
                     CompactionOutcome::TargetNotReached
                 );
             }
@@ -470,13 +503,24 @@ impl ChatSession {
             });
             self.push(response.message.clone());
             for call in &response.message.tool_calls {
-                if is_compaction_tool(&call.function.name) {
+                provider
+                    .stream_event(crate::StreamEvent::ToolStarted { call: call.clone() })
+                    .await?;
+                let result = if is_compaction_tool(&call.function.name) {
                     let result = self.execute_compaction_tool_call(call);
-                    self.push(result.into_message());
+                    self.push(result.clone().into_message());
+                    result
                 } else {
                     self.execute_tool_call_reporting_errors(registry, call, Some(round))
-                        .await;
-                }
+                        .await
+                };
+                provider
+                    .stream_event(crate::StreamEvent::ToolResult {
+                        tool_call_id: result.tool_call_id.clone(),
+                        name: result.name.clone(),
+                        content: result.content.clone(),
+                    })
+                    .await?;
             }
             completed_tool_rounds = round;
         }

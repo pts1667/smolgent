@@ -1,3 +1,4 @@
+use futures_util::StreamExt;
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use pyo3::{exceptions::PyRuntimeError, exceptions::PyValueError, prelude::*};
@@ -187,11 +188,13 @@ impl NativeAgent {
         })
     }
 
+    #[pyo3(signature = (content_json, tools, on_event=None))]
     fn arun<'py>(
         &self,
         py: Python<'py>,
         content_json: &str,
         tools: Vec<(String, Py<PyAny>)>,
+        on_event: Option<Py<PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let content: MessageContent = serde_json::from_str(content_json)
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
@@ -220,14 +223,35 @@ impl NativeAgent {
             .try_lock_owned()
             .map_err(|_| PyRuntimeError::new_err("agent is already running"))?;
         let provider = self.provider.clone();
+        let event_locals = locals.clone();
         bridge::future_into_py_with_locals(py, locals, async move {
             // Commit history only after success. Dropping a cancelled future releases the guard
             // and discards incomplete tool-call history; external tool effects cannot be undone.
             let mut session = guard.clone();
-            let response = session
-                .run_user_message_with_tools(&provider, &registry, content)
-                .await
-                .map_err(runtime_error)?;
+            let response = if let Some(callback) = on_event {
+                let mut stream =
+                    session.stream_user_message_with_tools(&provider, &registry, content);
+                let mut response = None;
+                while let Some(event) = stream.next().await {
+                    let event = event.map_err(runtime_error)?;
+                    if let smolgent::StreamEvent::Completed { response: result } = event {
+                        response = Some(result);
+                    } else {
+                        let payload = serde_json::to_string(&event).map_err(runtime_error)?;
+                        let future = Python::attach(|py| {
+                            let awaitable = callback.bind(py).call1((payload,))?;
+                            pyo3_async_runtimes::into_future_with_locals(&event_locals, awaitable)
+                        })?;
+                        future.await?;
+                    }
+                }
+                response.ok_or_else(|| runtime_error("stream ended without a final response"))?
+            } else {
+                session
+                    .run_user_message_with_tools(&provider, &registry, content)
+                    .await
+                    .map_err(runtime_error)?
+            };
             let result = json!({
                 "text": response.message.content.text(),
                 "message": response.message,
