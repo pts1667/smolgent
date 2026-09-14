@@ -6,7 +6,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use smolgent::{
     AgentState, ApiKeyRef, ChatProvider, ChatSession, KeyringCoreSecretStore, MessageContent,
-    ProviderConfig, ProviderKind, SecretStore, SessionConfig, Tool, ToolDefinition, ToolRegistry,
+    ProviderConfig, ProviderKind, ReasoningConfig, SecretStore, SessionConfig, Tool,
+    ToolDefinition, ToolRegistry,
 };
 use tokio::sync::Mutex;
 
@@ -29,6 +30,8 @@ struct Config {
     max_tool_rounds: usize,
     compaction: bool,
     timeout: f64,
+    thinking: Option<bool>,
+    reasoning_effort: Option<String>,
 }
 
 /// Internal bridge. The public, typed API lives in python/smolgent/__init__.py.
@@ -89,6 +92,7 @@ impl NativeAgent {
         }
         let mut provider_config = match config.provider.as_str() {
             "openrouter" => ProviderConfig::openrouter(&config.model),
+            "deepseek" => ProviderConfig::deepseek(&config.model),
             "llama_cpp" => ProviderConfig::llama_cpp(
                 config
                     .endpoint
@@ -100,6 +104,27 @@ impl NativeAgent {
             _ => return Err(PyValueError::new_err("unknown provider")),
         }
         .map_err(runtime_error)?;
+        if config.provider == "deepseek" {
+            if let Some(base_url) = &config.endpoint {
+                let mut base: reqwest::Url = base_url
+                    .parse()
+                    .map_err(|_| PyValueError::new_err("invalid base_url"))?;
+                base.path_segments_mut()
+                    .map_err(|_| PyValueError::new_err("invalid base_url"))?
+                    .pop_if_empty()
+                    .extend(["chat", "completions"]);
+                base.set_query(None);
+                base.set_fragment(None);
+                provider_config.chat_completions_url = base;
+            }
+            if config.thinking.is_some() || config.reasoning_effort.is_some() {
+                provider_config.reasoning = Some(ReasoningConfig {
+                    enabled: config.thinking,
+                    effort: config.reasoning_effort,
+                    ..ReasoningConfig::default()
+                });
+            }
+        }
         if config.provider == "compatible" {
             provider_config.name = "compatible".into();
             provider_config.kind = ProviderKind::OpenAiCompatible;

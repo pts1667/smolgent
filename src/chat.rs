@@ -214,8 +214,14 @@ pub(crate) struct AssistantWireMessage {
     pub reasoning_content: Option<String>,
     #[serde(default)]
     pub reasoning_details: Option<Value>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_tool_calls")]
     pub tool_calls: Vec<ToolCall>,
+}
+
+fn null_tool_calls<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<ToolCall>, D::Error> {
+    Ok(Option::<Vec<ToolCall>>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 impl AssistantWireMessage {

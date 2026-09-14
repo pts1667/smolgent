@@ -35,6 +35,8 @@ impl ModelCapabilities {
 pub enum ProviderKind {
     /// OpenRouter's OpenAI-compatible chat-completions endpoint.
     OpenRouter,
+    /// DeepSeek's chat-completions endpoint, including thinking mode.
+    DeepSeek,
     /// A local llama.cpp server exposing `/v1/chat/completions`.
     LlamaCpp,
     /// Generic OpenAI-compatible endpoint.
@@ -85,6 +87,32 @@ pub struct ProviderConfig {
 }
 
 impl ProviderConfig {
+    /// DeepSeek configuration using the compatibility keyring id `deepseek`.
+    /// Prefer [`Self::deepseek_with_keyring`] for an application-specific key id.
+    /// With `reasoning: None`, the API's default thinking settings apply.
+    pub fn deepseek(model: impl Into<String>) -> Result<Self> {
+        Self::deepseek_with_keyring(model, "deepseek")
+    }
+
+    /// DeepSeek configuration using an app-provided keyring id.
+    /// `reasoning.enabled` maps to `thinking.type`, and `reasoning.effort` maps
+    /// to `reasoning_effort`. Excluding reasoning or setting a separate reasoning
+    /// token budget is unsupported. Reasoning is retained for tool-call replay.
+    pub fn deepseek_with_keyring(
+        model: impl Into<String>,
+        keyring_id: impl Into<String>,
+    ) -> Result<Self> {
+        Ok(Self {
+            name: "deepseek".into(),
+            kind: ProviderKind::DeepSeek,
+            chat_completions_url: Url::parse("https://api.deepseek.com/chat/completions")?,
+            api_key: ApiKeyRef::Keyring(keyring_id.into()),
+            default_model: model.into(),
+            headers: Vec::new(),
+            reasoning: None,
+        })
+    }
+
     /// OpenRouter configuration using a compatibility key id named `openrouter`.
     ///
     /// Apps should usually prefer [`ProviderConfig::openrouter_with_keyring`] so each application
@@ -174,14 +202,14 @@ impl ChatProvider {
     ///
     /// llama.cpp uses `/props?model=...`; vision, audio, and video are enabled only when
     /// explicitly advertised. Older servers without metadata return `None`.
-    /// Returns `None` for generic providers, automatic routing, unknown model IDs, or missing
+    /// Returns `None` for DeepSeek, generic providers, automatic routing, unknown model IDs, or missing
     /// modality metadata. Known aliases and variant suffixes are resolved by OpenRouter.
     /// Fetch once when constructing tools; rebuild them if the application's model changes.
     pub async fn model_capabilities(&self) -> Result<Option<ModelCapabilities>> {
         match self.config.kind {
             ProviderKind::LlamaCpp => self.llama_cpp_capabilities().await,
             ProviderKind::OpenRouter => self.openrouter_capabilities().await,
-            ProviderKind::OpenAiCompatible => Ok(None),
+            ProviderKind::DeepSeek | ProviderKind::OpenAiCompatible => Ok(None),
         }
     }
 
@@ -303,7 +331,8 @@ impl ChatProvider {
 
     /// Send a pre-built request and parse the response.
     /// llama.cpp video parts are translated to `input_video` at the HTTP boundary;
-    /// the request and session content types remain provider-independent.
+    /// DeepSeek reasoning controls and file parts are adapted to its wire format.
+    /// The request and session content types remain provider-independent.
     pub async fn send_request(&self, request: ChatRequest) -> Result<ChatResponse> {
         let builder = self
             .client
@@ -314,7 +343,9 @@ impl ChatProvider {
                 matches!(&message.content, MessageContent::Parts(parts)
                     if parts.iter().any(|part| matches!(part, ContentPart::VideoUrl { .. })))
             });
-        let builder = if needs_video_conversion {
+        let builder = if self.config.kind == ProviderKind::DeepSeek {
+            builder.json(&deepseek_request_body(&request)?)
+        } else if needs_video_conversion {
             let mut body = serde_json::to_value(&request)?;
             // Transform only typed message content, including tool results. Do not touch
             // tool arguments/schemas or other JSON that happens to contain similar keys.
@@ -446,6 +477,45 @@ impl ChatProvider {
     }
 }
 
+// Keep the common request and session representation intact; adapt only the wire body.
+fn deepseek_request_body(request: &ChatRequest) -> Result<Value> {
+    let mut body = serde_json::to_value(request)?;
+    body.as_object_mut().unwrap().remove("reasoning");
+    if let Some(reasoning) = &request.reasoning {
+        if reasoning.exclude == Some(true) || reasoning.max_tokens.is_some() {
+            return Err(Error::InvalidProviderConfig(
+                "DeepSeek does not support reasoning.exclude=true or reasoning.max_tokens".into(),
+            ));
+        }
+        if let (Some(enabled), Some(effort)) = (reasoning.enabled, &reasoning.effort)
+            && enabled == (effort == "none")
+        {
+            return Err(Error::InvalidProviderConfig(
+                "DeepSeek thinking toggle conflicts with reasoning effort".into(),
+            ));
+        }
+        if let Some(enabled) = reasoning.enabled {
+            body["thinking"] = json!({"type": if enabled { "enabled" } else { "disabled" }});
+        }
+        if let Some(effort) = &reasoning.effort {
+            body["reasoning_effort"] = json!(effort);
+        }
+    }
+    for message in body["messages"].as_array_mut().unwrap() {
+        if let Some(parts) = message["content"].as_array_mut() {
+            for part in parts {
+                // DeepSeek file parts have flat fields; our canonical format nests them.
+                if part["type"] == "file" {
+                    let mut file = part["file"].take();
+                    file["type"] = json!("file");
+                    *part = file;
+                }
+            }
+        }
+    }
+    Ok(body)
+}
+
 pub fn json_object_response_format() -> Value {
     json!({ "type": "json_object" })
 }
@@ -462,6 +532,105 @@ mod tests {
     use super::*;
     use crate::ReasoningPayload;
     use crate::secrets::{KeyringCoreSecretStore, SecretStore};
+
+    #[tokio::test]
+    async fn deepseek_request_uses_keyring_auth_and_preserves_reasoning() {
+        let mut config =
+            ProviderConfig::deepseek_with_keyring("deepseek-flash", "test/deepseek").unwrap();
+        assert_eq!(config.kind, ProviderKind::DeepSeek);
+        assert_eq!(
+            config.chat_completions_url.as_str(),
+            "https://api.deepseek.com/chat/completions"
+        );
+        let server = MockServer::start();
+        config.chat_completions_url = server.url("/chat/completions").parse().unwrap();
+        config.reasoning = Some(ReasoningConfig {
+            enabled: Some(true),
+            effort: Some("high".into()),
+            ..Default::default()
+        });
+        let keyring: Arc<CredentialStore> = keyring_core::mock::Store::new().unwrap();
+        let secrets = Arc::new(KeyringCoreSecretStore::with_store("smolgent-test", keyring));
+        secrets.set_api_key("test/deepseek", "sk-test").unwrap();
+        let provider = ChatProvider::new(config).with_secrets(secrets);
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/chat/completions")
+                .header("authorization", "Bearer sk-test")
+                .json_body(json!({
+                    "model": "deepseek-flash",
+                    "messages": [{"role": "user", "content": "Hello"}],
+                    "thinking": {"type": "enabled"}, "reasoning_effort": "high"
+                }));
+            then.status(200).json_body(json!({"choices": [{"message": {
+                "role": "assistant", "content": "Hi", "reasoning_content": "Thought",
+                "tool_calls": null
+            }}]}));
+        });
+        let response = provider
+            .send_messages(&[ChatMessage::user("Hello")])
+            .await
+            .unwrap();
+        assert_eq!(response.message.content, "Hi");
+        assert_eq!(
+            response.reasoning.unwrap().reasoning_content.as_deref(),
+            Some("Thought")
+        );
+        assert!(provider.model_capabilities().await.unwrap().is_none());
+        mock.assert();
+    }
+
+    #[test]
+    fn deepseek_thinking_controls_and_unsupported_options() {
+        let provider = ChatProvider::new(ProviderConfig::deepseek("any-model").unwrap());
+        let mut request = provider.build_request(&[ChatMessage::user("Hi")], vec![]);
+        let body = deepseek_request_body(&request).unwrap();
+        assert!(body.get("reasoning").is_none());
+        assert!(body.get("thinking").is_none());
+        assert!(body.get("reasoning_effort").is_none());
+        request.reasoning = Some(ReasoningConfig {
+            enabled: Some(false),
+            ..Default::default()
+        });
+        assert_eq!(
+            deepseek_request_body(&request).unwrap()["thinking"],
+            json!({"type": "disabled"})
+        );
+        request.reasoning = Some(ReasoningConfig {
+            effort: Some("none".into()),
+            ..Default::default()
+        });
+        assert_eq!(
+            deepseek_request_body(&request).unwrap()["reasoning_effort"],
+            "none"
+        );
+        for reasoning in [
+            ReasoningConfig {
+                exclude: Some(true),
+                ..Default::default()
+            },
+            ReasoningConfig {
+                max_tokens: Some(100),
+                ..Default::default()
+            },
+            ReasoningConfig {
+                enabled: Some(true),
+                effort: Some("none".into()),
+                ..Default::default()
+            },
+            ReasoningConfig {
+                enabled: Some(false),
+                effort: Some("high".into()),
+                ..Default::default()
+            },
+        ] {
+            request.reasoning = Some(reasoning);
+            assert!(matches!(
+                deepseek_request_body(&request),
+                Err(Error::InvalidProviderConfig(_))
+            ));
+        }
+    }
 
     #[test]
     fn literal_api_keys_are_redacted_from_debug_output() {

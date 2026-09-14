@@ -2,7 +2,7 @@
 //!
 //! `smolgent` provides a few building blocks:
 //!
-//! - [`ChatProvider`] for OpenRouter, llama.cpp, and other chat-completions endpoints.
+//! - [`ChatProvider`] for OpenRouter, DeepSeek, llama.cpp, and other chat-completions endpoints.
 //! - [`ChatSession`] for preserving conversation history, reasoning payloads, tool calls, and
 //!   tool results.
 //! - [`ToolRegistry`] plus the [`tool`] macro for exposing Rust functions as LLM tools.

@@ -29,6 +29,9 @@ pub enum Error {
     #[error("api key is not configured for provider '{0}'")]
     MissingApiKey(String),
 
+    #[error("invalid provider configuration: {0}")]
+    InvalidProviderConfig(String),
+
     #[error("provider response exceeded the {limit} byte limit")]
     ProviderResponseTooLarge { limit: usize },
 

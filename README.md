@@ -54,6 +54,51 @@ You can always just use a .env file or even environment variables if you don't c
 
 - llama.cpp
 - Openrouter
+- DeepSeek
+
+### DeepSeek
+
+Python: set `DEEPSEEK_API_KEY`, then call `Agent.deepseek("deepseek-flash")`.
+It supports the same tools, history, and async methods as the other presets.
+See the [Python guide](python/README.md#deepseek) and
+[tool example](python/examples/deepseek_agent.py).
+
+Rust: use `ProviderConfig::deepseek(model)` or
+`ProviderConfig::deepseek_with_keyring(model, "my-app/deepseek")`, and attach a
+secret store containing the matching key. For environment credentials, assign
+`config.api_key = ApiKeyRef::Literal(key)`; the Rust preset itself does not read
+environment variables. The [minimal example](examples/deepseek_chat.rs) does:
+
+```powershell
+$env:DEEPSEEK_API_KEY = "..."
+cargo run --example deepseek_chat
+# Optional: $env:DEEPSEEK_MODEL = "deepseek-v4-pro"
+$env:SMOLGENT_PROVIDER = "deepseek"
+cargo run --release --example full_cli -- . --read-only
+```
+
+The preset uses `https://api.deepseek.com/chat/completions`. Omitted reasoning
+configuration uses the API defaults. To disable thinking in Rust:
+
+```rust
+use smolgent::{ProviderConfig, ReasoningConfig};
+let mut config = ProviderConfig::deepseek("deepseek-flash")?;
+config.reasoning = Some(ReasoningConfig {
+    enabled: Some(false),
+    ..Default::default()
+});
+```
+
+`ReasoningConfig.enabled` maps to `thinking.type`, and `effort` maps to the
+top-level `reasoning_effort`. A separate reasoning token budget and excluding
+reasoning are unsupported. Reasoning from every assistant turn is retained for
+tool-call replay. See the [DeepSeek API docs](https://api-docs.deepseek.com/)
+and [thinking guide](https://api-docs.deepseek.com/guides/thinking_mode/).
+
+Image parts use the existing constructors; inline image file parts are adapted
+at the HTTP boundary. DeepSeek model capability discovery is not implemented,
+so the provider-aware built-in reader remains text-only. Audio/video, PDF parsing,
+file uploads, and streaming are outside this integration.
 
 ## Context Compaction
 

@@ -172,7 +172,7 @@ async fn direct_requests_translate_video_and_preserve_image_audio_and_order() {
     });
     let provider = provider(&server);
     // Cover pre-built requests as well as the higher-level send_messages path.
-    let request = provider.build_request(&[message.clone()], Vec::new());
+    let request = provider.build_request(std::slice::from_ref(&message), Vec::new());
     assert_eq!(request.messages[0], message);
     let reply = provider.send_request(request).await.unwrap();
     assert_eq!(reply.message.content, "Description");

@@ -219,9 +219,17 @@ fn configured_provider() -> smolgent::Result<ChatProvider> {
             return Ok(ChatProvider::new(config));
         }
         "openrouter" => {}
+        "deepseek" => {
+            let api_key = env::var("DEEPSEEK_API_KEY")
+                .map_err(|_| Error::MissingApiKey("deepseek (DEEPSEEK_API_KEY)".into()))?;
+            let model = env::var("DEEPSEEK_MODEL").unwrap_or_else(|_| "deepseek-flash".into());
+            let mut config = ProviderConfig::deepseek(model)?;
+            config.api_key = ApiKeyRef::Literal(api_key);
+            return Ok(ChatProvider::new(config));
+        }
         other => {
             return Err(Error::Tool(format!(
-                "unknown SMOLGENT_PROVIDER '{other}'; use openrouter or llama-cpp"
+                "unknown SMOLGENT_PROVIDER '{other}'; use openrouter, deepseek, or llama-cpp"
             )));
         }
     }

@@ -109,7 +109,7 @@ def tool(handler: Callable[..., Any] | None = None, /, *,
 class Agent:
     """A provider, conversation, and tool registry in one object.
 
-    Use :meth:`openrouter`, :meth:`llama_cpp`, or :meth:`compatible` to select a
+    Use :meth:`openrouter`, :meth:`deepseek`, :meth:`llama_cpp`, or :meth:`compatible` to select a
     provider. No filesystem tools are enabled unless roots are supplied. Write
     roots also grant read access. Relative paths resolve against the process's
     working directory, not against the first root.
@@ -134,21 +134,33 @@ class Agent:
         max_tool_rounds: int = 32,
         compaction: bool = True,
         timeout: float = 120.0,
+        thinking: bool | None = None,
+        reasoning_effort: str | None = None,
     ) -> None:
         if not isinstance(model, str) or not model.strip():
             raise ValueError("model must be a nonempty string")
-        if provider not in {"openrouter", "llama_cpp", "compatible"}:
+        if provider not in {"openrouter", "deepseek", "llama_cpp", "compatible"}:
             raise ValueError("unknown provider")
+        if thinking is not None and not isinstance(thinking, bool):
+            raise ValueError("thinking must be a bool or None")
+        if reasoning_effort is not None and reasoning_effort not in {"none", "low", "high", "max"}:
+            raise ValueError("reasoning_effort must be none, low, high, or max")
+        if thinking is not None or reasoning_effort is not None:
+            if provider != "deepseek":
+                raise ValueError("thinking and reasoning_effort are currently DeepSeek options")
+            if thinking is not None and reasoning_effort is not None and thinking == (reasoning_effort == "none"):
+                raise ValueError("thinking conflicts with reasoning_effort")
         if provider == "openrouter" and endpoint is not None:
             raise ValueError("use Agent.compatible() for a custom endpoint")
         if api_key is not None and keyring_id is not None:
             raise ValueError("choose api_key or keyring_id")
         if keyring_id is not None and not keyring_id.strip():
             raise ValueError("keyring_id must be nonempty")
-        if provider == "openrouter" and api_key is None and keyring_id is None:
-            api_key = os.environ.get("OPENROUTER_API_KEY")
+        if provider in {"openrouter", "deepseek"} and api_key is None and keyring_id is None:
+            variable = f"{provider.upper()}_API_KEY"
+            api_key = os.environ.get(variable)
             if not api_key:
-                raise ValueError("set OPENROUTER_API_KEY or supply api_key or keyring_id")
+                raise ValueError(f"set {variable} or supply api_key or keyring_id")
         if api_key is not None and not api_key.strip():
             raise ValueError("api_key must be nonempty")
         if isinstance(max_tool_rounds, bool) or not isinstance(max_tool_rounds, int) or max_tool_rounds < 0:
@@ -174,12 +186,27 @@ class Agent:
             "system_prompt": system_prompt, "read_roots": read_paths,
             "write_roots": write_paths, "max_tool_rounds": max_tool_rounds,
             "compaction": compaction, "timeout": timeout,
+            "thinking": thinking, "reasoning_effort": reasoning_effort,
         }, allow_nan=False))
 
     @classmethod
     def openrouter(cls, model: str, **kwargs: Any) -> Agent:
         """Use OpenRouter, reading OPENROUTER_API_KEY unless credentials are supplied."""
         return cls(model, provider="openrouter", **kwargs)
+
+    @classmethod
+    def deepseek(cls, model: str = "deepseek-flash", *, base_url: str | None = None,
+                 thinking: bool | None = None, reasoning_effort: str | None = None,
+                 **kwargs: Any) -> Agent:
+        """Use DeepSeek, reading DEEPSEEK_API_KEY unless credentials are supplied.
+
+        Omitted thinking options use the API defaults. Set thinking=False to
+        disable thinking, or reasoning_effort to low, high, or max to enable it
+        at that effort (none disables it). base_url is a server root or prefix,
+        such as https://api.deepseek.com/v1, without /chat/completions.
+        """
+        return cls(model, provider="deepseek", endpoint=base_url, thinking=thinking,
+                   reasoning_effort=reasoning_effort, **kwargs)
 
     @classmethod
     def llama_cpp(cls, model: str, *, base_url: str = "http://127.0.0.1:8080",

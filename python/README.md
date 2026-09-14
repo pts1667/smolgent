@@ -53,6 +53,49 @@ Write roots grant read access too. Paths resolve against the process working
 directory. The search tool requires `rg` on PATH. Custom Python tools execute
 with the application's permissions; filesystem roots apply to built-in tools.
 
+## DeepSeek
+
+Set `DEEPSEEK_API_KEY`, then use the same agent and tool API:
+
+```python
+from smolgent import Agent
+agent = Agent.deepseek("deepseek-flash", read_roots=["."])
+print(agent.run("Read README.md and summarize this project in three sentences."))
+```
+
+The model argument defaults to `deepseek-flash`; any model ID can be supplied.
+Explicit `api_key="..."` or `keyring_id="my-app/deepseek"` takes precedence over
+the environment. Store a keyring key with `set_api_key("my-app/deepseek", key)`.
+`base_url="https://api.deepseek.com/v1"` optionally overrides the server root or
+path prefix; `/chat/completions` is appended automatically.
+
+Omitting thinking options uses the API defaults. DeepSeek currently enables
+thinking by default. Use `Agent.deepseek(thinking=False)` to disable it, or
+`Agent.deepseek(reasoning_effort="max")` to select effort. Supported Python values
+are `"low"`, `"high"`, `"max"`, and `"none"` (disables thinking). Contradictory
+thinking and effort settings raise `ValueError`. Reasoning is returned in
+`response.reasoning` and preserved across tool calls and subsequent user turns,
+as required by the [DeepSeek thinking guide](https://api-docs.deepseek.com/guides/thinking_mode/).
+
+Custom `@tool` functions and `await agent.arun(...)` work identically. See the
+[tool example](examples/deepseek_agent.py).
+
+For models with vision, use the existing `Image` wrapper or Pillow objects:
+
+```python
+from smolgent import Image
+print(agent.run(["Describe this image.", Image.from_file("image.png")]))
+```
+
+DeepSeek documents image input for `deepseek-flash` in JPEG, PNG, GIF, and WebP
+formats. `File` wrappers containing inline image data are translated to DeepSeek's
+flat file-part format. This does not add audio/video, PDF parsing, file uploads,
+or streaming. See [DeepSeek's vision guide](https://api-docs.deepseek.com/guides/vision/)
+for current model and format limits. The chat API reference also lists image
+parts in tool messages; availability is subject to the selected model and service
+([chat API reference](https://api-docs.deepseek.com/api/create-chat-completion/)).
+Built-in `read` remains text-only; use custom media tools for images.
+
 ## Async applications and notebooks
 
 ```python
