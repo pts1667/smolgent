@@ -141,6 +141,24 @@ class AgentTests(unittest.TestCase):
             self.assertEqual(local_agent(url, tools=[broken]).run("Try").text, "Recovered")
             self.assertIn("cannot calculate", requests[1][2]["messages"][-1]["content"])
 
+    def test_inferred_tool_schema_and_defaults_through_rust_loop(self):
+        @tool
+        def add(a: int, b: int = 5) -> int:
+            """Add two integers."""
+            return a + b
+
+        with server(answer(None, tool_calls=[call("add", {"a": 7})]),
+                    answer("12")) as (url, requests):
+            self.assertEqual(local_agent(url, tools=[add]).run("Add").text, "12")
+            self.assertEqual(requests[0][2]["tools"], [{"type": "function", "function": {
+                "name": "add", "description": "Add two integers.", "parameters": {
+                    "type": "object", "properties": {
+                        "a": {"type": "integer"}, "b": {"type": "integer"},
+                    }, "required": ["a"], "additionalProperties": False,
+                },
+            }}])
+            self.assertEqual(requests[1][2]["messages"][-1]["content"], "12")
+
     def test_read_tool_and_root_enforcement(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -9,9 +9,10 @@ import math
 import os
 import re
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Iterable
+from typing import Any, Awaitable, Callable, Iterable, overload
 
 from ._native import NativeAgent, SmolgentError, set_api_key
+from ._schema import infer_parameters
 
 __all__ = ["Agent", "Response", "SmolgentError", "Tool", "set_api_key", "tool"]
 
@@ -74,14 +75,30 @@ class Tool:
         return json.dumps(result, allow_nan=False)
 
 
-def tool(*, parameters: dict[str, Any], name: str | None = None,
-         description: str | None = None) -> Callable[[Callable[..., Any]], Tool]:
-    """Create a tool using an explicit JSON Schema and the function's docstring."""
+@overload
+def tool(handler: Callable[..., Any], /, *, parameters: dict[str, Any] | None = None,
+         name: str | None = None, description: str | None = None) -> Tool: ...
+
+
+@overload
+def tool(*, parameters: dict[str, Any] | None = None, name: str | None = None,
+         description: str | None = None) -> Callable[[Callable[..., Any]], Tool]: ...
+
+
+def tool(handler: Callable[..., Any] | None = None, /, *,
+         parameters: dict[str, Any] | None = None, name: str | None = None,
+         description: str | None = None) -> Tool | Callable[[Callable[..., Any]], Tool]:
+    """Create a tool using argument type hints and the function's docstring.
+
+    Use @tool, @tool(), or @tool(name=..., description=...). Parameters with
+    defaults may be omitted. Explicit parameters= overrides schema inference.
+    Missing or unsupported argument annotations require an explicit schema.
+    """
     def decorate(handler: Callable[..., Any]) -> Tool:
         return Tool(name or handler.__name__,
                     description if description is not None else inspect.getdoc(handler) or "",
-                    parameters, handler)
-    return decorate
+                    parameters if parameters is not None else infer_parameters(handler), handler)
+    return decorate if handler is None else decorate(handler)
 
 
 class Agent:

@@ -68,22 +68,49 @@ tool loop. `compaction=False` disables the Rust core's default context compactio
 
 ## Python tools
 
-Tools use an explicit JSON Schema. Both ordinary and `async def` functions work:
+Tools infer their JSON Schema from argument type hints. Both ordinary and
+`async def` functions work:
 
 ```python
 from smolgent import Agent, tool
 
-@tool(parameters={
-    "type": "object",
-    "properties": {"city": {"type": "string"}},
-    "required": ["city"],
-})
+@tool
 def weather(city: str):
     """Get an illustrative weather report for a city."""
     return {"city": city, "temperature_c": 20}
 
 agent = Agent.openrouter("openrouter/auto", tools=[weather])
 print(agent.run("Use weather to get the report for London."))
+```
+
+`@tool`, `@tool()`, and `@tool(name="...", description="...")` all support inference.
+The function's docstring supplies the description unless overridden. Supported
+argument hints are `str`, `int`, `float`, `bool`, `None`, `Any`, `list[T]`,
+`dict[str, T]`, unions (`T | U` or `Union[T, U]`), `Optional[T]`, and `Literal`
+of strings, integers, booleans, or `None`. Nested containers and their `typing`
+equivalents work; bare `list`/`dict` allow arbitrary contents. `Annotated[T, ...]`
+uses `T`, ignoring metadata. Quoted/postponed hints must resolve in the function's
+module. Return hints do not affect the input schema.
+
+Arguments without defaults are required, including nullable arguments such as
+`city: str | None`. A default (`city: str | None = None`) allows omission and
+Python applies it when the tool runs. Keyword-only arguments work too. Inference
+does not coerce or validate values at runtime.
+
+Every argument needs a supported hint for inference. Missing/unsupported hints,
+positional-only arguments, `*args`, and `**kwargs` raise an error when decorating.
+Use `@tool(parameters={...})` to provide an explicit schema instead; it takes
+precedence over hints and also supports functions without annotations. For example:
+
+```python
+@tool(parameters={
+    "type": "object",
+    "properties": {"city": {"type": "string", "minLength": 1}},
+    "required": ["city"],
+})
+def weather(city):
+    """Get an illustrative weather report for a city."""
+    return {"city": city, "temperature_c": 20}
 ```
 
 The decorator returns a `Tool` object. Alternatively construct
@@ -134,5 +161,5 @@ response = agent.run([
 
 The model must support the requested media. The core also accepts file, audio,
 and video content parts; see the main README for formats. This first Python API
-uses the text file reader. Model-aware media reading, event/telemetry subscriptions,
-and automatic JSON Schema generation from Python annotations are not exposed yet.
+uses the text file reader. Model-aware media reading and event/telemetry
+subscriptions are not exposed yet.

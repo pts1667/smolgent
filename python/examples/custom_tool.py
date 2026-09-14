@@ -3,11 +3,7 @@
 from smolgent import Agent, tool
 
 
-@tool(parameters={
-    "type": "object",
-    "properties": {"a": {"type": "integer"}, "b": {"type": "integer"}},
-    "required": ["a", "b"],
-})
+@tool
 def add(a: int, b: int) -> int:
     """Add two integers."""
     return a + b
