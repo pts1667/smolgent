@@ -10,6 +10,9 @@ readme = "python/README.md"
 requires-python = ">=3.10"
 license = "MIT"
 
+[project.optional-dependencies]
+images = ["Pillow>=10"]
+
 [tool.maturin]
 manifest-path = "smolgent-python/Cargo.toml"
 python-source = "python"

@@ -11,6 +11,14 @@ With Rust and Python installed, run from the repository root:
 python -m pip install .
 ```
 
+For Pillow image objects, install the optional image extra:
+
+```shell
+python -m pip install ".[images]"
+```
+
+Audio, video, files, and images supplied as encoded bytes or URLs work without Pillow.
+
 For development, create and activate a virtual environment, then:
 
 ```shell
@@ -115,10 +123,88 @@ def weather(city):
 
 The decorator returns a `Tool` object. Alternatively construct
 `Tool(name, description, parameters, handler)` directly. Functions receive keyword
-arguments and return JSON-serializable values. Async tools run on the caller's
+arguments and return JSON values or media (see below). Async tools run on the caller's
 event loop; synchronous tools run in its thread pool. Both preserve context
 variables. Tool exceptions become model-visible errors, matching Rust behavior.
 Provider/transport failures raise `SmolgentError`, a subclass of `RuntimeError`.
+
+## Multimodal tool output
+
+Return a Pillow image directly from a tool; the binding encodes it as PNG:
+
+```python
+from PIL import ImageGrab, Image
+from smolgent import tool
+
+@tool
+def screenshot() -> Image.Image:
+    """Capture the current screen."""
+    return ImageGrab.grab()
+```
+
+Add the tool to `Agent.openrouter(model, tools=[screenshot])`, using a model that
+supports both tools and the media you supply. The actual return value determines
+the attachment type; return annotations are optional. Sync and async tools work.
+
+For audio, video, and documents, return a wrapper:
+
+```python
+from smolgent import Audio, Video, File, MultimodalResult, tool
+
+@tool
+def recording() -> Audio:
+    """Retrieve the audio recording."""
+    return Audio.from_file("recording.wav")
+
+@tool
+def evidence() -> MultimodalResult:
+    """Retrieve the recording, clip, and report."""
+    return MultimodalResult([
+        "Recording and supporting material:",
+        Audio.from_file("recording.wav"),
+        Video.from_file("clip.mp4"),
+        File.from_file("report.pdf"),
+    ])
+```
+
+`MultimodalResult` preserves the order of text, wrappers, Pillow images, and raw
+content dictionaries. Ordinary dictionary/list tool returns remain JSON text;
+wrap content parts in `MultimodalResult` to send actual attachments. A tool can
+return a single wrapper or Pillow image without the container.
+
+| Wrapper | Local file | Encoded bytes | Remote URL |
+| --- | --- | --- | --- |
+| `Image` | `Image.from_file("photo.png")` | `Image.from_bytes(data, mime_type="image/png")` | `Image.from_url(url)` |
+| `Audio` | `Audio.from_file("recording.wav")` | `Audio.from_bytes(data, format="wav")` | Not supported by the core audio format |
+| `Video` | `Video.from_file("clip.mp4")` | `Video.from_bytes(data, mime_type="video/mp4")` | `Video.from_url(url)` |
+| `File` | `File.from_file("report.pdf")` | `File.from_bytes(data, mime_type="application/pdf", filename="report.pdf")` | `File.from_url(url, filename="report.pdf")` |
+
+Helpers read local files immediately and infer MIME type/audio format from the
+extension. Supply `mime_type=` or `format=` explicitly when needed. Unknown
+document extensions default to `application/octet-stream`. Encoded bytes must
+already contain the appropriate file format, such as WAV or MP4; these helpers
+do not record, synthesize, transcode, or extract video frames. URLs are forwarded
+to the provider. Supported media, codecs, and attachment sizes depend on the
+provider/model, including support for media in tool messages.
+
+For explicit Pillow encoding options, use smolgent's `Image` wrapper:
+
+```python
+from smolgent import Image
+
+attachment = Image.from_pil(pil_image, format="JPEG", max_size=(1280, 1280), quality=85)
+```
+
+`from_pil` encodes an independent snapshot, applies EXIF orientation, and preserves
+aspect ratio when resizing. PNG is the default; JPEG flattens transparency onto
+white. `Image` constructors also accept `detail="auto"`, `"low"`, or `"high"`.
+Automatic Pillow encoding runs in a worker thread. Explicit `from_file` and
+`from_pil` calls are synchronous; use `asyncio.to_thread` for expensive work inside
+an async tool. Keep a directly returned Pillow image open until it is encoded,
+or call `Image.from_pil` inside its file context manager.
+
+Runnable examples: [image_tool.py](examples/image_tool.py) generates an image in
+memory; [multimodal_tool.py](examples/multimodal_tool.py) returns a selected file.
 
 ## Credentials and other endpoints
 
@@ -150,7 +236,21 @@ agent = Agent.compatible(
 reasoning, annotations, and tool results. `agent.reset()` restores the initial
 system prompt. Override that prompt with `system_prompt="..."` at construction.
 
-Pass ordered content dictionaries for direct multimodal input:
+The same wrappers, Pillow images, and `MultimodalResult` work in `run()` and
+`arun()`. Combine attachments and text in a list:
+
+```python
+from smolgent import Image, Audio, Video
+
+response = agent.run([
+    "Compare this image with the clip.",
+    Image.from_file("photo.png"),
+    Video.from_file("clip.mp4"),
+])
+response = await agent.arun(["Transcribe this.", Audio.from_file("recording.wav")])
+```
+
+Raw content dictionaries remain supported:
 
 ```python
 response = agent.run([
@@ -159,7 +259,6 @@ response = agent.run([
 ])
 ```
 
-The model must support the requested media. The core also accepts file, audio,
-and video content parts; see the main README for formats. This first Python API
-uses the text file reader. Model-aware media reading and event/telemetry
+The model must support the requested media. The built-in `read` tool still uses
+the text file reader; use custom tools to return media. Model-aware media reading and event/telemetry
 subscriptions are not exposed yet.

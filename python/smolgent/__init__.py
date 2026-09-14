@@ -12,11 +12,14 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Iterable, overload
 
 from ._native import NativeAgent, SmolgentError, set_api_key
+from ._media import (
+    Audio, Content, File, Image, MultimodalResult, Video, serialize_prompt, serialize_tool_result,
+)
 from ._schema import infer_parameters
 
-__all__ = ["Agent", "Response", "SmolgentError", "Tool", "set_api_key", "tool"]
+__all__ = ["Agent", "Audio", "File", "Image", "MultimodalResult", "Response",
+           "SmolgentError", "Tool", "Video", "set_api_key", "tool"]
 
-Content = str | list[dict[str, Any]]
 Path = str | os.PathLike[str]
 
 
@@ -38,8 +41,9 @@ class Tool:
     """A Python callable accepting keyword arguments described by a JSON Schema.
 
     Synchronous callables run in asyncio's thread pool. Async callables run on the
-    caller's event loop. Results must be JSON serializable; failures are sent back
-    to the model as tool errors, allowing it to correct arguments and retry.
+    caller's event loop. Return JSON values, media wrappers, Pillow images, or a
+    MultimodalResult. Failures are sent back to the model as tool errors, allowing
+    it to correct arguments and retry.
     """
 
     name: str
@@ -72,7 +76,8 @@ class Tool:
             result = await asyncio.to_thread(self.handler, **arguments)
             if inspect.isawaitable(result):
                 result = await result
-        return json.dumps(result, allow_nan=False)
+        # Image encoding can be expensive; keep it off the caller's event loop.
+        return await asyncio.to_thread(serialize_tool_result, result)
 
 
 @overload
@@ -191,7 +196,8 @@ class Agent:
     async def arun(self, prompt: Content) -> Response:
         """Run the Rust agent loop, executing tools until a final answer arrives.
 
-        Accepts text or ordered OpenAI-style multimodal content dictionaries.
+        Accepts text, media wrappers, Pillow images, MultimodalResult, or a list
+        mixing these parts with OpenAI-style content dictionaries.
         The timeout option limits each HTTP request, not the entire agent run.
         Use asyncio.wait_for for an overall deadline.
         """
@@ -215,7 +221,7 @@ class Agent:
 
         try:
             result = await self._native.arun(
-                json.dumps(prompt, allow_nan=False),
+                await asyncio.to_thread(serialize_prompt, prompt),
                 [(item._definition(), adapter(item)) for item in self._tools],
             )
             return Response(**json.loads(result))

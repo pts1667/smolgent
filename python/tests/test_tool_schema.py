@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import unittest
 from typing import Annotated, Any, Dict, List, Literal, Optional, Union
 
@@ -36,7 +37,8 @@ class ToolSchemaTests(unittest.TestCase):
         self.assertEqual(search.parameters["required"], ["query"])
         self.assertEqual(search.parameters["properties"]["query"],
                          {"anyOf": [{"type": "string"}, {"type": "null"}]})
-        self.assertEqual(asyncio.run(search._invoke('{"query": null}')), '[null, 10, null]')
+        self.assertEqual(json.loads(asyncio.run(search._invoke('{"query": null}'))),
+                         {"kind": "json", "value": [None, 10, None]})
 
     def test_nested_types_and_typing_equivalents(self):
         @tool()
@@ -71,7 +73,7 @@ class ToolSchemaTests(unittest.TestCase):
 
         self.assertEqual(ready.parameters, {"type": "object", "properties": {},
                                            "required": [], "additionalProperties": False})
-        self.assertEqual(asyncio.run(ready._invoke('{}')), 'true')
+        self.assertEqual(json.loads(asyncio.run(ready._invoke('{}'))), {"kind": "json", "value": True})
 
     def test_return_annotation_is_not_resolved(self):
         @tool
@@ -89,7 +91,8 @@ class ToolSchemaTests(unittest.TestCase):
             return value
 
         self.assertIs(echo.parameters, schema)
-        self.assertEqual(asyncio.run(echo._invoke('{"value": "hello"}')), '"hello"')
+        self.assertEqual(json.loads(asyncio.run(echo._invoke('{"value": "hello"}'))),
+                         {"kind": "json", "value": "hello"})
 
         @tool(parameters=schema)
         def untyped(value):

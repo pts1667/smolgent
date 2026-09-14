@@ -3,7 +3,7 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 use pyo3::{exceptions::PyRuntimeError, exceptions::PyValueError, prelude::*};
 use pyo3_async_runtimes::{TaskLocals, tokio as bridge};
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 use smolgent::{
     AgentState, ApiKeyRef, ChatProvider, ChatSession, KeyringCoreSecretStore, MessageContent,
     ProviderConfig, ProviderKind, SecretStore, SessionConfig, Tool, ToolDefinition, ToolRegistry,
@@ -40,10 +40,19 @@ struct NativeAgent {
     builtins: ToolRegistry,
 }
 
+// Always tag callback results, including ordinary JSON. A user dictionary that
+// happens to resemble a content part must never become an attachment implicitly.
+#[derive(Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+enum PythonToolOutput {
+    Json(Value),
+    Content(MessageContent),
+}
+
 fn python_tool(definition: ToolDefinition, callback: Py<PyAny>, locals: TaskLocals) -> Tool {
     let callback = Arc::new(callback);
     let locals = Arc::new(locals);
-    Tool::new(definition, move |arguments| {
+    Tool::new_multimodal(definition, move |arguments| {
         let callback = callback.clone();
         let locals = locals.clone();
         Box::pin(async move {
@@ -58,7 +67,11 @@ fn python_tool(definition: ToolDefinition, callback: Py<PyAny>, locals: TaskLoca
                 .map_err(|error| smolgent::Error::Tool(error.to_string()))?;
             let output = Python::attach(|py| output.extract::<String>(py))
                 .map_err(|error| smolgent::Error::Tool(error.to_string()))?;
-            Ok(serde_json::from_str(&output)?)
+            Ok(match serde_json::from_str::<PythonToolOutput>(&output)? {
+                PythonToolOutput::Content(content) => content,
+                PythonToolOutput::Json(Value::String(text)) => MessageContent::Text(text),
+                PythonToolOutput::Json(value) => MessageContent::Text(value.to_string()),
+            })
         })
     })
 }
