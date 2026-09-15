@@ -112,17 +112,6 @@ config.reasoning = Some(ReasoningConfig {
 });
 ```
 
-`ReasoningConfig.enabled` maps to `thinking.type`, and `effort` maps to the
-top-level `reasoning_effort`. A separate reasoning token budget and excluding
-reasoning are unsupported. Reasoning from every assistant turn is retained for
-tool-call replay. See the [DeepSeek API docs](https://api-docs.deepseek.com/)
-and [thinking guide](https://api-docs.deepseek.com/guides/thinking_mode/).
-
-Image parts use the existing constructors; inline image file parts are adapted
-at the HTTP boundary. DeepSeek model capability discovery is not implemented,
-so the provider-aware built-in reader remains text-only. Audio/video, PDF parsing,
-file uploads, and streaming are outside this integration.
-
 ## Context Compaction
 
 Context compaction is enabled by default.

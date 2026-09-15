@@ -74,8 +74,14 @@ thinking by default. Use `Agent.deepseek(thinking=False)` to disable it, or
 `Agent.deepseek(reasoning_effort="max")` to select effort. Supported Python values
 are `"low"`, `"high"`, `"max"`, and `"none"` (disables thinking). Contradictory
 thinking and effort settings raise `ValueError`. Reasoning is returned in
-`response.reasoning` and preserved across tool calls and subsequent user turns,
-as required by the [DeepSeek thinking guide](https://api-docs.deepseek.com/guides/thinking_mode/).
+`response.reasoning`, stored in history, and sent back on subsequent requests.
+This does not guarantee the model sees it: the
+[DeepSeek thinking guide](https://api-docs.deepseek.com/guides/thinking_mode/)
+says prior reasoning is ignored without the `tools` parameter, and included
+with it. An agent with `compaction=False` and no custom or filesystem tools sends
+no `tools` parameter. Default compaction does offer tools, even if you configure
+no custom tools. A model's claim about its own reasoning access is not a reliable
+transport test; see the [live Rust diagnostic](../examples/deepseek_reasoning.md).
 
 Custom `@tool` functions and `await agent.arun(...)` work identically. See the
 [tool example](examples/deepseek_agent.py).
