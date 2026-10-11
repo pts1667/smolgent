@@ -84,6 +84,10 @@ pub struct ProviderConfig {
     pub headers: Vec<(String, String)>,
     /// Optional provider-specific reasoning configuration.
     pub reasoning: Option<ReasoningConfig>,
+    /// Extra top-level request fields added to every request built by [`ChatProvider::build_request`],
+    /// for options the typed request does not cover (for example llama.cpp's
+    /// `"thinking_budget_tokens": 0` to turn thinking off).
+    pub extra_body: serde_json::Map<String, Value>,
 }
 
 impl ProviderConfig {
@@ -109,6 +113,7 @@ impl ProviderConfig {
             api_key: ApiKeyRef::Keyring(keyring_id.into()),
             default_model: model.into(),
             headers: Vec::new(),
+            extra_body: serde_json::Map::new(),
             reasoning: None,
         })
     }
@@ -135,6 +140,7 @@ impl ProviderConfig {
             api_key: ApiKeyRef::Keyring(keyring_id.into()),
             default_model: model.into(),
             headers: Vec::new(),
+            extra_body: serde_json::Map::new(),
             reasoning: Some(ReasoningConfig::openrouter_enabled()),
         })
     }
@@ -158,6 +164,7 @@ impl ProviderConfig {
             api_key: ApiKeyRef::None,
             default_model: model.into(),
             headers: Vec::new(),
+            extra_body: serde_json::Map::new(),
             reasoning: None,
         })
     }
@@ -356,6 +363,7 @@ impl ChatProvider {
             max_tokens: None,
             reasoning: self.config.reasoning.clone(),
             response_format: None,
+            extra: self.config.extra_body.clone(),
         }
     }
 
@@ -855,6 +863,34 @@ mod tests {
                 limit: MAX_RESPONSE_BYTES
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn extra_body_fields_are_sent_at_top_level() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .body_contains("\"thinking_budget_tokens\":0")
+                .body_contains("\"model\":\"local-model\"");
+            then.status(200).json_body(json!({
+                "choices": [{"message": {"role": "assistant", "content": "ok"}}]
+            }));
+        });
+
+        let mut config = ProviderConfig::llama_cpp(server.base_url(), "local-model").unwrap();
+        config
+            .extra_body
+            .insert("thinking_budget_tokens".into(), json!(0));
+        let provider = ChatProvider::new(config);
+
+        let response = provider
+            .send_messages(&[ChatMessage::user("hi")])
+            .await
+            .unwrap();
+
+        mock.assert();
+        assert_eq!(response.message.content, "ok");
     }
 
     #[tokio::test]

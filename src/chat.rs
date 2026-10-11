@@ -184,6 +184,10 @@ pub struct ChatRequest {
     pub reasoning: Option<ReasoningConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_format: Option<Value>,
+    /// Provider-specific top-level fields sent as-is, such as llama.cpp's
+    /// `thinking_budget_tokens`. Keys must not repeat the typed fields above.
+    #[serde(default, flatten, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub extra: serde_json::Map<String, Value>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
