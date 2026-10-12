@@ -204,12 +204,16 @@ impl ToolRegistry {
         self.tools.get(name)
     }
 
-    /// Definitions to send to a model.
+    /// Definitions to send to a model, sorted by name. The order must not change between requests: chat templates
+    /// render the tools into the prompt, and a different order breaks the server's prompt cache.
     pub fn definitions(&self) -> Vec<ToolDefinition> {
-        self.tools
+        let mut definitions: Vec<ToolDefinition> = self
+            .tools
             .values()
             .map(|tool| tool.definition().clone())
-            .collect()
+            .collect();
+        definitions.sort_by(|a, b| a.name().cmp(b.name()));
+        definitions
     }
 
     /// Execute one provider tool call, returning an error if the tool or arguments are invalid.
@@ -275,6 +279,33 @@ mod tests {
 
     use super::*;
     use crate::chat::ToolCallFunction;
+
+    #[test]
+    fn definitions_come_in_the_same_order_from_every_registry() {
+        let registry = || {
+            ["delta", "alpha", "echo", "charlie", "bravo"]
+                .into_iter()
+                .fold(ToolRegistry::new(), |registry, name| {
+                    registry.with_tool(Tool::new(
+                        ToolDefinition::new(name, "A tool.", json!({"type": "object"})),
+                        |_| Box::pin(async { Ok(json!(null)) }),
+                    ))
+                })
+        };
+        let names = |registry: ToolRegistry| {
+            registry
+                .definitions()
+                .into_iter()
+                .map(|d| d.name().to_owned())
+                .collect::<Vec<_>>()
+        };
+        for _ in 0..20 {
+            assert_eq!(
+                names(registry()),
+                ["alpha", "bravo", "charlie", "delta", "echo"]
+            );
+        }
+    }
 
     #[tokio::test]
     async fn registry_executes_tool_calls() {
