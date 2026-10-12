@@ -259,6 +259,7 @@ fn configured_sessions_create_bounded_event_streams() {
 
     let config = SessionConfig {
         max_tool_rounds: 3,
+        stop_after_tools: Vec::new(),
         event_channel_capacity: Some(2),
         notifications: NotificationConfig::tools(),
         compaction: CompactionConfig::default(),
@@ -416,7 +417,8 @@ async fn compaction_rounds_rebuild_history_and_instructions_after_edits() {
         assert_eq!(requests.len(), 2);
         let mut messages = requests[1].messages.clone();
         let instruction = messages.pop().unwrap();
-        assert_eq!(messages, session.messages());
+        assert_eq!(messages, session.messages_with_turn_ids());
+        assert!(messages[0].content.text().starts_with("[turn_id=1] "));
         assert!(
             !serde_json::to_string(&requests[1])
                 .unwrap()
@@ -428,6 +430,7 @@ async fn compaction_rounds_rebuild_history_and_instructions_after_edits() {
                 &session.config.compaction,
                 &session
                     .context_usage_breakdown_with_limit(session.config.compaction.top_consumers),
+                &compaction::protected_ids(&session.turns, &session.config.compaction),
             ))
         );
         assert_eq!(messages[messages.len() - 2].tool_calls[0].id, "compact_1");
@@ -887,4 +890,228 @@ async fn model_payload_telemetry_captures_request_and_response() {
             ..
         } if response.message.content == "pong"
     )));
+}
+
+/// A session with a system prompt and `n` exchanges, each a user turn, a tool call, its result
+/// and an answer.
+fn session_with_exchanges(
+    config: SessionConfig,
+    n: usize,
+) -> (ChatSession, Option<AgentEventReceiver>) {
+    let (mut session, receiver) = ChatSession::with_system_prompt_and_config("system", config);
+    for i in 0..n {
+        session.push_user(format!("question {i} {}", "x".repeat(400)));
+        session.push(ChatMessage {
+            tool_calls: vec![ToolCall {
+                id: format!("call_{i}"),
+                kind: "function".to_string(),
+                function: ToolCallFunction {
+                    name: "lookup".to_string(),
+                    arguments: "{}".to_string(),
+                },
+            }],
+            ..ChatMessage::assistant("")
+        });
+        session.push(ChatMessage::tool_result(
+            format!("call_{i}"),
+            "lookup",
+            "y".repeat(400),
+        ));
+        session.push_assistant(format!("answer {i}"));
+    }
+    (session, receiver)
+}
+
+#[tokio::test]
+async fn trim_only_compaction_drops_oldest_exchanges_without_asking_the_model() {
+    let server = MockServer::start();
+    let any = server.mock(|when, then| {
+        when.method(POST);
+        then.status(500);
+    });
+    let provider =
+        ChatProvider::new(ProviderConfig::llama_cpp(server.base_url(), "model").unwrap());
+    let (mut session, receiver) = session_with_exchanges(
+        SessionConfig {
+            compaction: CompactionConfig::trim_only(500, 300),
+            notifications: NotificationConfig {
+                compaction: true,
+                ..NotificationConfig::default()
+            },
+            ..SessionConfig::default()
+        },
+        4,
+    );
+    let before = session.estimated_context_tokens();
+    session.maybe_compact(&provider).await.unwrap();
+    any.assert_hits(0);
+
+    let after = session.estimated_context_tokens();
+    assert!(after <= 300, "{before} -> {after}");
+    let texts = session
+        .turns()
+        .iter()
+        .map(|t| t.content.text().into_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(texts[0], "system");
+    assert_eq!(
+        session.turns()[1].name.as_deref(),
+        Some(compaction::TRIMMED_NOTE_NAME)
+    );
+    // Whole exchanges went, oldest first; the latest stays.
+    assert!(
+        !texts
+            .iter()
+            .any(|t| t.starts_with("question 0") || t.starts_with("question 2"))
+    );
+    assert!(texts.iter().any(|t| t.starts_with("question 3")));
+    assert_eq!(session.turns()[2].role, MessageRole::User);
+    // Every remaining tool result still has its call.
+    for turn in session
+        .turns()
+        .iter()
+        .filter(|t| t.role == MessageRole::Tool)
+    {
+        let id = turn.tool_call_id.as_deref().unwrap();
+        assert!(
+            session
+                .turns()
+                .iter()
+                .any(|t| t.tool_calls.iter().any(|c| c.id == id))
+        );
+    }
+    let events = receiver.unwrap().try_iter().collect::<Vec<_>>();
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentEvent::CompactionTrimmed {
+            removed_turns: 12,
+            ..
+        }
+    )));
+
+    // A second trim keeps a single note.
+    for i in 4..8 {
+        session.push_user(format!("question {i} {}", "x".repeat(400)));
+        session.push_assistant(format!("answer {i}"));
+    }
+    session.maybe_compact(&provider).await.unwrap();
+    let notes = session
+        .turns()
+        .iter()
+        .filter(|t| t.name.as_deref() == Some(compaction::TRIMMED_NOTE_NAME))
+        .count();
+    assert_eq!(notes, 1);
+}
+
+#[test]
+fn trimming_keeps_the_latest_exchange_even_above_the_target() {
+    let (mut session, _) = session_with_exchanges(
+        SessionConfig {
+            compaction: CompactionConfig {
+                protect_recent_turns: 0,
+                ..CompactionConfig::trim_only(1, 0)
+            },
+            ..SessionConfig::default()
+        },
+        1,
+    );
+    let removed = compaction::trim_oldest(
+        &mut session.turns,
+        &mut session.next_turn_id,
+        &session.config.compaction,
+    );
+    assert_eq!(removed, 0);
+    assert_eq!(session.turns().len(), 5);
+}
+
+#[test]
+fn trim_only_never_offers_compaction_tools() {
+    let (session, _) = ChatSession::with_config(SessionConfig {
+        compaction: CompactionConfig {
+            always_offer_tools: true,
+            ..CompactionConfig::trim_only(10, 5)
+        },
+        ..SessionConfig::default()
+    });
+    assert!(
+        session
+            .definitions_with_compaction(&ToolRegistry::new())
+            .is_empty()
+    );
+}
+
+#[test]
+fn compaction_skips_protected_and_unknown_ids_instead_of_failing() {
+    let (mut session, _) = session_with_exchanges(SessionConfig::default(), 3);
+    let last = session.turns().last().unwrap().id;
+    let result = session
+        .compact_remove_messages(&[1, 2, 3, 4, 999, last], "old")
+        .unwrap();
+    assert!(
+        result.contains("Skipped turn_ids: 1 (protected), 999 (unknown)"),
+        "{result}"
+    );
+    assert!(session.turns().iter().all(|t| ![2, 3, 4].contains(&t.id)));
+    assert_eq!(session.turns()[0].id, 1);
+    assert_eq!(session.turns().last().unwrap().id, last);
+
+    let error = session
+        .compact_remove_messages(&[1, last], "nothing")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("no turn_id can be compacted"), "{error}");
+    assert!(error.contains("protected turn_ids: [1, "), "{error}");
+}
+
+#[tokio::test]
+async fn stop_after_tools_ends_the_loop_on_a_successful_call() {
+    let server = MockServer::start();
+    let submit = |id: &str, value: i64| {
+        json!({"choices": [{"message": {"content": null, "tool_calls": [{
+            "id": id, "type": "function",
+            "function": {"name": "submit", "arguments": json!({"value": value}).to_string()}
+        }]}}]})
+    };
+    // The first call is rejected by the tool; the second succeeds and ends the loop.
+    let first = server.mock(|when, then| {
+        when.method(POST).matches(|request| {
+            let body: serde_json::Value =
+                serde_json::from_slice(request.body.as_deref().unwrap()).unwrap();
+            body["messages"].as_array().unwrap().last().unwrap()["role"] == "user"
+        });
+        then.status(200).json_body(submit("bad", -1));
+    });
+    let second = server.mock(|when, then| {
+        when.method(POST).body_contains("must be positive");
+        then.status(200).json_body(submit("good", 3));
+    });
+    let provider =
+        ChatProvider::new(ProviderConfig::llama_cpp(server.base_url(), "model").unwrap());
+    let registry = ToolRegistry::new().with_tool(Tool::new(
+        ToolDefinition::new("submit", "Submit the answer.", json!({"type": "object"})),
+        |arguments| {
+            Box::pin(async move {
+                if arguments["value"].as_i64().unwrap() < 0 {
+                    return Err(crate::Error::Tool("must be positive".into()));
+                }
+                Ok(json!("ok"))
+            })
+        },
+    ));
+    let (mut session, _) = ChatSession::with_config(SessionConfig {
+        stop_after_tools: vec!["submit".to_string()],
+        ..SessionConfig::default()
+    });
+    let response = session
+        .run_user_message_with_tools(&provider, &registry, "go")
+        .await
+        .unwrap();
+    first.assert_hits(1);
+    second.assert_hits(1);
+    assert_eq!(response.message.tool_calls[0].id, "good");
+    assert_eq!(session.turns().last().unwrap().role, MessageRole::Tool);
+    assert_eq!(
+        session.turns().last().unwrap().tool_call_id.as_deref(),
+        Some("good")
+    );
 }

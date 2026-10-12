@@ -122,6 +122,24 @@ Configure this with `SessionConfig::default().compaction`, or use `CompactionCon
 
 Each compaction round uses the updated conversation and usage breakdown. If an automatic attempt does not reach its target, further automatic attempts are deferred until the next managed agent run. The model can still use compaction tools during normal tool rounds when `always_offer_tools` is enabled.
 
+In a compaction request every message is prefixed with its `[turn_id=N]` and the protected turn ids are listed. Compaction calls accept a single id or numeric strings for `turn_ids`, and unknown or protected ids are skipped (and reported) rather than failing the whole call.
+
+Small models often still fail at compaction. Set `trim_oldest` to drop the oldest exchanges (a user message and everything up to the next one, so tool calls stay paired with their results) when model compaction leaves the context above the target. `CompactionConfig::trim_only(trigger, target)` does only that, without asking the model or offering it the compaction tools:
+
+```rust
+use smolgent::{CompactionConfig, SessionConfig};
+let config = SessionConfig {
+    compaction: CompactionConfig::trim_only(70_000, 35_000),
+    ..SessionConfig::default()
+};
+```
+
+The root system prompt, the protected recent turns and the latest exchange are always kept, and a short system note marks that earlier messages were removed.
+
+## Ending the Loop on a Tool Call
+
+`SessionConfig::stop_after_tools` names tools whose successful call is the answer, such as a `submit` tool. The managed loop returns the response that made the call instead of asking the model for a closing message. A failed call (the tool returned an error) does not stop the loop, so the model can correct it.
+
 Token estimates cover text and metadata only. Media and parsed PDF annotations are excluded because their token costs depend on the model, resolution, duration, and document contents. Track provider usage for media-heavy sessions; automatic compaction cannot reliably predict those costs.
 
 ## Telemetry

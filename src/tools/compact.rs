@@ -1,5 +1,5 @@
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 use crate::tools::ToolDefinition;
 use crate::{Error, Result};
@@ -15,6 +15,7 @@ pub const COMPACT_SUMMARIZE_MESSAGES: &str = "compact_summarize_messages";
 #[derive(Deserialize, JsonSchema)]
 pub(crate) struct RemoveMessagesArgs {
     /// Stable turn IDs to remove from the active context.
+    #[serde(deserialize_with = "one_or_many_ids")]
     pub turn_ids: Vec<u64>,
     /// Brief reason these turns are safe to remove.
     #[serde(default)]
@@ -29,12 +30,45 @@ pub(crate) struct RemoveMessagesArgs {
 #[derive(Deserialize, JsonSchema)]
 pub(crate) struct SummarizeMessagesArgs {
     /// Stable turn IDs to summarize and remove from the active context.
+    #[serde(deserialize_with = "one_or_many_ids")]
     pub turn_ids: Vec<u64>,
     /// Concise replacement summary preserving facts still needed later.
     pub summary: String,
     /// Brief reason summarization is appropriate.
     #[serde(default)]
     pub reason: String,
+}
+
+/// Small models often send `"turn_ids": 5` or `["5"]` instead of `[5]`; accept those too.
+fn one_or_many_ids<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Vec<u64>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Id {
+        Number(u64),
+        Text(String),
+    }
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Ids {
+        One(Id),
+        Many(Vec<Id>),
+    }
+    let ids = match Ids::deserialize(deserializer)? {
+        Ids::One(id) => vec![id],
+        Ids::Many(ids) => ids,
+    };
+    ids.into_iter()
+        .map(|id| match id {
+            Id::Number(n) => Ok(n),
+            Id::Text(text) => text
+                .trim()
+                .trim_start_matches("turn_id=")
+                .parse()
+                .map_err(|_| serde::de::Error::custom(format!("turn_id {text:?} is not a number"))),
+        })
+        .collect()
 }
 
 pub(crate) fn parse_remove_args(arguments: &str) -> Result<RemoveMessagesArgs> {
@@ -108,5 +142,26 @@ mod tests {
             remove.function.parameters["properties"]["turn_ids"]["description"],
             "Stable turn IDs to remove from the active context."
         );
+        assert_eq!(
+            remove.function.parameters["properties"]["turn_ids"]["type"],
+            "array"
+        );
+    }
+
+    #[test]
+    fn turn_ids_accept_one_id_and_numeric_strings() {
+        assert_eq!(
+            parse_remove_args(r#"{"turn_ids": 7}"#).unwrap().turn_ids,
+            vec![7]
+        );
+        assert_eq!(
+            parse_remove_args(r#"{"turn_ids": [2, "3", "turn_id=4"]}"#)
+                .unwrap()
+                .turn_ids,
+            vec![2, 3, 4]
+        );
+        assert!(parse_remove_args(r#"{"turn_ids": ["old"]}"#).is_err());
+        let summarize = parse_summarize_args(r#"{"turn_ids": "5", "summary": "s"}"#).unwrap();
+        assert_eq!(summarize.turn_ids, vec![5]);
     }
 }

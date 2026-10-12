@@ -339,6 +339,13 @@ fn agent_event_status(event: &AgentEvent) -> String {
             "compaction finished after {rounds} round(s): {before_estimated_tokens} -> {after_estimated_tokens} estimated tokens"
         ),
         AgentEvent::CompactionSkipped { reason } => format!("compaction skipped: {reason}"),
+        AgentEvent::CompactionTrimmed {
+            removed_turns,
+            before_estimated_tokens,
+            after_estimated_tokens,
+        } => format!(
+            "trimmed {removed_turns} old turns: {before_estimated_tokens} -> {after_estimated_tokens} tokens"
+        ),
     }
 }
 

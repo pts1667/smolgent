@@ -10,6 +10,11 @@ use crate::{Error, Result};
 /// When enabled, the managed tool loop can ask the model to remove or summarize older turns using
 /// built-in compaction tools. Explicit compaction is triggered before a normal model request when
 /// the estimated token count reaches [`CompactionConfig::trigger_estimated_tokens`].
+///
+/// Small models often fail to call the compaction tools correctly. With
+/// [`CompactionConfig::trim_oldest`], the session then drops the oldest exchanges itself until the
+/// target is reached; with [`CompactionConfig::model_compaction`] off, it only does that, without
+/// asking the model.
 /// Estimates cover text and metadata only; media token costs and parsed file annotations are
 /// excluded because their tokenization depends on the model and media properties. For media-heavy
 /// sessions, applications should track provider usage rather than relying on this trigger alone.
@@ -29,6 +34,14 @@ pub struct CompactionConfig {
     pub protect_recent_turns: usize,
     /// Number of largest turns/tool calls included in explicit compaction breakdowns.
     pub top_consumers: usize,
+    /// Ask the model to compact with the built-in tools when the trigger is reached, and offer
+    /// them per [`CompactionConfig::always_offer_tools`]. When false, the tools are never offered.
+    pub model_compaction: bool,
+    /// When the context is still above the target after model compaction (or instead of it),
+    /// drop the oldest exchanges (a user message and everything after it up to the next one)
+    /// until the target is reached. The root system prompt, protected recent turns and the
+    /// latest exchange are kept.
+    pub trim_oldest: bool,
 }
 
 impl Default for CompactionConfig {
@@ -41,6 +54,8 @@ impl Default for CompactionConfig {
             always_offer_tools: true,
             protect_recent_turns: 4,
             top_consumers: 30,
+            model_compaction: true,
+            trim_oldest: false,
         }
     }
 }
@@ -53,7 +68,23 @@ impl CompactionConfig {
             ..Self::default()
         }
     }
+
+    /// Compaction without the model: at the trigger, drop the oldest exchanges until the target.
+    pub fn trim_only(trigger_estimated_tokens: usize, target_estimated_tokens: usize) -> Self {
+        Self {
+            trigger_estimated_tokens,
+            target_estimated_tokens,
+            always_offer_tools: false,
+            model_compaction: false,
+            trim_oldest: true,
+            ..Self::default()
+        }
+    }
 }
+
+/// Name of the system note that marks a trimmed conversation.
+pub(crate) const TRIMMED_NOTE_NAME: &str = "context_trimmed";
+const TRIMMED_NOTE: &str = "Earlier messages of this conversation were removed to save context.";
 
 /// Estimated usage for one session turn.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -108,6 +139,26 @@ pub struct ContextUsageBreakdown {
 struct CompactionEdit {
     remove_turn_ids: HashSet<u64>,
     remove_tool_call_ids: HashSet<String>,
+    /// Requested ids that were left alone, with the reason.
+    skipped: Vec<(u64, &'static str)>,
+}
+
+impl CompactionEdit {
+    fn skipped_list(&self) -> String {
+        self.skipped
+            .iter()
+            .map(|(id, why)| format!("{id} ({why})"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    fn skipped_note(&self) -> String {
+        if self.skipped.is_empty() {
+            String::new()
+        } else {
+            format!(" Skipped turn_ids: {}.", self.skipped_list())
+        }
+    }
 }
 
 pub(crate) fn usage_breakdown(turns: &[SessionTurn], limit: usize) -> ContextUsageBreakdown {
@@ -142,9 +193,10 @@ pub(crate) fn remove_messages(
     reason: &str,
 ) -> Result<String> {
     let edit = compaction_edit(turns, config, turn_ids)?;
+    let skipped = edit.skipped_note();
     let removed = apply_compaction_edit(turns, edit, None);
     Ok(format!(
-        "Removed {removed} turn(s) from active context. Reason: {reason}"
+        "Removed {removed} turn(s) from active context. Reason: {reason}{skipped}"
     ))
 }
 
@@ -162,6 +214,7 @@ pub(crate) fn summarize_messages(
         ));
     }
     let edit = compaction_edit(turns, config, turn_ids)?;
+    let skipped = edit.skipped_note();
     let insert_at = turns
         .iter()
         .position(|turn| edit.remove_turn_ids.contains(&turn.id))
@@ -183,7 +236,7 @@ pub(crate) fn summarize_messages(
     };
     let removed = apply_compaction_edit(turns, edit, Some((insert_at, summary_turn)));
     Ok(format!(
-        "Summarized {removed} turn(s) in active context. Reason: {reason}"
+        "Summarized {removed} turn(s) in active context. Reason: {reason}{skipped}"
     ))
 }
 
@@ -215,28 +268,130 @@ pub(crate) fn remove_previous_tool_messages(turns: &mut Vec<SessionTurn>) -> usi
         CompactionEdit {
             remove_turn_ids,
             remove_tool_call_ids,
+            skipped: Vec::new(),
         },
         None,
     )
 }
 
-pub(crate) fn instruction(config: &CompactionConfig, breakdown: &ContextUsageBreakdown) -> String {
+pub(crate) fn instruction(
+    config: &CompactionConfig,
+    breakdown: &ContextUsageBreakdown,
+    protected: &[u64],
+) -> String {
     format!(
         "Context compaction is required before answering the user.\n\
          Reuse this existing conversation and system message; do not create a separate context.\n\
          Use only the built-in compaction tools to reduce the active context toward about {} estimated tokens.\n\
-         Prefer trimming old read/ripgrep tool results, stale searches, and obsolete file dumps.\n\
+         Each message above starts with its [turn_id=N]; pass those numbers as a list, e.g. \"turn_ids\": [2, 3, 4].\n\
+         Prefer trimming old tool results, stale searches, and obsolete file dumps.\n\
          Summarize message sets when their conclusions are still useful, and remove them entirely when irrelevant.\n\
-         Never remove the root system prompt or recent conversation.\n\n\
+         Never remove the root system prompt or recent conversation. Protected turn_ids: {:?}.\n\n\
          Current estimated context: {} tokens, {} bytes.\n\n\
          Largest turns:\n{}\n\n\
          Largest tool calls:\n{}",
         config.target_estimated_tokens,
+        protected,
         breakdown.total_estimated_tokens,
         breakdown.total_bytes,
         format_turn_breakdown(&breakdown.largest_turns),
         format_tool_breakdown(&breakdown.largest_tool_calls),
     )
+}
+
+/// Turn ids that compaction never removes: the root system prompt and the most recent turns.
+pub(crate) fn protected_ids(turns: &[SessionTurn], config: &CompactionConfig) -> Vec<u64> {
+    let protected = protected_turn_ids(turns, config);
+    let mut ids = protected.into_iter().collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids
+}
+
+/// Drop the oldest exchanges until the estimate is at most the target. An exchange starts at a
+/// user message and runs up to the next one, so tool calls stay paired with their results.
+/// Returns the number of turns removed.
+pub(crate) fn trim_oldest(
+    turns: &mut Vec<SessionTurn>,
+    next_turn_id: &mut u64,
+    config: &CompactionConfig,
+) -> usize {
+    let target = config.target_estimated_tokens;
+    let mut total = estimated_tokens(turns);
+    if total <= target {
+        return 0;
+    }
+    let protected = protected_turn_ids(turns, config);
+    let root = usize::from(
+        turns
+            .first()
+            .is_some_and(|turn| turn.role == MessageRole::System),
+    );
+    let last_user = turns
+        .iter()
+        .rposition(|turn| turn.role == MessageRole::User);
+
+    // Exchange boundaries after the root: each user message starts one; anything before the
+    // first user message (older summaries, notes) forms its own leading group.
+    let mut starts = vec![root];
+    starts.extend(
+        turns
+            .iter()
+            .enumerate()
+            .skip(root + 1)
+            .filter(|(_, turn)| turn.role == MessageRole::User)
+            .map(|(index, _)| index),
+    );
+    starts.dedup();
+
+    let mut remove = HashSet::new();
+    for (n, &start) in starts.iter().enumerate() {
+        if total <= target {
+            break;
+        }
+        let end = starts.get(n + 1).copied().unwrap_or(turns.len());
+        if last_user.is_some_and(|last| last < end) {
+            break; // the latest exchange always stays
+        }
+        let group = &turns[start..end];
+        if group.iter().any(|turn| protected.contains(&turn.id)) {
+            break;
+        }
+        for turn in group {
+            if turn.name.as_deref() == Some(TRIMMED_NOTE_NAME) {
+                continue;
+            }
+            total = total.saturating_sub(estimate_tokens_from_chars(estimate_turn_chars(turn)));
+            remove.insert(turn.id);
+        }
+    }
+    if remove.is_empty() {
+        return 0;
+    }
+    let before = turns.len();
+    turns.retain(|turn| !remove.contains(&turn.id));
+    let removed = before - turns.len();
+    if !turns
+        .iter()
+        .any(|turn| turn.name.as_deref() == Some(TRIMMED_NOTE_NAME))
+    {
+        let note = SessionTurn {
+            id: allocate_turn_id(next_turn_id),
+            role: MessageRole::System,
+            content: TRIMMED_NOTE.into(),
+            annotations: Vec::new(),
+            reasoning: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            name: Some(TRIMMED_NOTE_NAME.to_string()),
+        };
+        turns.insert(root.min(turns.len()), note);
+    }
+    removed
+}
+
+/// Rough token estimate of the whole transcript, as in [`usage_breakdown`].
+pub(crate) fn estimated_tokens(turns: &[SessionTurn]) -> usize {
+    estimate_tokens_from_chars(turns.iter().map(estimate_turn_chars).sum())
 }
 
 fn compaction_edit(
@@ -254,16 +409,24 @@ fn compaction_edit(
     let known = turns.iter().map(|turn| turn.id).collect::<HashSet<_>>();
     let mut edit = CompactionEdit::default();
 
+    // Unknown and protected ids are skipped, so one wrong id does not void the whole request.
     for turn_id in turn_ids {
         if !known.contains(turn_id) {
-            return Err(Error::Tool(format!("unknown turn_id {turn_id}")));
+            edit.skipped.push((*turn_id, "unknown"));
+        } else if protected.contains(turn_id) {
+            edit.skipped.push((*turn_id, "protected"));
+        } else {
+            add_turn_to_compaction_edit(turns, *turn_id, &mut edit);
         }
-        if protected.contains(turn_id) {
-            return Err(Error::Tool(format!("turn_id {turn_id} is protected")));
-        }
-        add_turn_to_compaction_edit(turns, *turn_id, &mut edit);
     }
 
+    if edit.remove_turn_ids.is_empty() {
+        return Err(Error::Tool(format!(
+            "no turn_id can be compacted: {}; protected turn_ids: {:?}",
+            edit.skipped_list(),
+            protected_ids(turns, config)
+        )));
+    }
     Ok(edit)
 }
 

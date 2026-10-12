@@ -142,6 +142,12 @@ pub enum AgentEvent {
     },
     /// Context compaction did not run or ignored an invalid compaction request.
     CompactionSkipped { reason: String },
+    /// The oldest exchanges were dropped to reach the compaction target.
+    CompactionTrimmed {
+        removed_turns: usize,
+        before_estimated_tokens: usize,
+        after_estimated_tokens: usize,
+    },
 }
 
 impl NotificationConfig {
@@ -158,7 +164,8 @@ impl NotificationConfig {
             | AgentEvent::CompactionBreakdown { .. }
             | AgentEvent::CompactionToolCallStarted { .. }
             | AgentEvent::CompactionFinished { .. }
-            | AgentEvent::CompactionSkipped { .. } => self.compaction,
+            | AgentEvent::CompactionSkipped { .. }
+            | AgentEvent::CompactionTrimmed { .. } => self.compaction,
         }
     }
 }

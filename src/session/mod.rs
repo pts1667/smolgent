@@ -16,7 +16,8 @@ use std::fmt;
 use std::sync::mpsc::{SyncSender, sync_channel};
 
 use crate::chat::{
-    ChatMessage, ChatRequest, ChatResponse, MessageContent, MessageRole, ReasoningPayload, ToolCall,
+    ChatMessage, ChatRequest, ChatResponse, ContentPart, MessageContent, MessageRole,
+    ReasoningPayload, ToolCall,
 };
 use crate::provider::ChatProvider;
 use crate::tools::compact::{
@@ -90,6 +91,10 @@ impl From<SessionTurn> for ChatMessage {
 pub struct SessionConfig {
     /// Maximum normal tool-call rounds before the managed loop stops.
     pub max_tool_rounds: usize,
+    /// Tools that end the managed loop: once a call to one of them succeeds, the loop returns the
+    /// response that made the call, without asking the model for a final answer. Useful for a
+    /// "submit" tool whose call is the answer.
+    pub stop_after_tools: Vec<String>,
     /// Optional capacity for the [`AgentEventReceiver`]. Defaults to `4 * max_tool_rounds`.
     pub event_channel_capacity: Option<usize>,
     /// Which high-level agent progress events to emit.
@@ -106,6 +111,7 @@ impl Default for SessionConfig {
     fn default() -> Self {
         Self {
             max_tool_rounds: 32,
+            stop_after_tools: Vec::new(),
             event_channel_capacity: None,
             notifications: NotificationConfig::default(),
             compaction: CompactionConfig::default(),
@@ -328,7 +334,8 @@ impl ChatSession {
 
     fn definitions_with_compaction(&self, registry: &ToolRegistry) -> Vec<ToolDefinition> {
         let mut definitions = registry.definitions();
-        if self.config.compaction.enabled && self.config.compaction.always_offer_tools {
+        let compaction = &self.config.compaction;
+        if compaction.enabled && compaction.model_compaction && compaction.always_offer_tools {
             definitions.extend(compaction_tool_definitions());
         }
         definitions
@@ -360,6 +367,26 @@ impl ChatSession {
 
     fn remove_previous_compaction_tool_messages(&mut self) -> usize {
         compaction::remove_previous_tool_messages(&mut self.turns)
+    }
+
+    /// The history as provider messages, each prefixed with its `[turn_id=N]`, for compaction
+    /// requests: the model can only name turns it can see the ids of.
+    fn messages_with_turn_ids(&self) -> Vec<ChatMessage> {
+        self.turns
+            .iter()
+            .map(|turn| {
+                let label = format!("[turn_id={}] ", turn.id);
+                let mut message = ChatMessage::from(turn.clone());
+                message.content = match message.content {
+                    MessageContent::Text(text) => MessageContent::Text(label + &text),
+                    MessageContent::Parts(mut parts) => {
+                        parts.insert(0, ContentPart::text(label));
+                        MessageContent::Parts(parts)
+                    }
+                };
+                message
+            })
+            .collect()
     }
 
     /// Add a user message, send one provider request without tools, and persist the assistant reply.
@@ -502,6 +529,7 @@ impl ChatSession {
                 tool_calls: response.message.tool_calls.len(),
             });
             self.push(response.message.clone());
+            let mut stop = false;
             for call in &response.message.tool_calls {
                 provider
                     .stream_event(crate::StreamEvent::ToolStarted { call: call.clone() })
@@ -511,8 +539,11 @@ impl ChatSession {
                     self.push(result.clone().into_message());
                     result
                 } else {
-                    self.execute_tool_call_reporting_errors(registry, call, Some(round))
-                        .await
+                    let (result, ok) = self
+                        .execute_tool_call_checked(registry, call, Some(round))
+                        .await;
+                    stop |= ok && self.config.stop_after_tools.contains(&call.function.name);
+                    result
                 };
                 provider
                     .stream_event(crate::StreamEvent::ToolResult {
@@ -521,6 +552,9 @@ impl ChatSession {
                         content: result.content.clone(),
                     })
                     .await?;
+            }
+            if stop {
+                return Ok(response);
             }
             completed_tool_rounds = round;
         }
@@ -551,15 +585,21 @@ impl ChatSession {
         });
 
         let mut rounds = 0;
-        while rounds < self.config.compaction.max_compaction_rounds {
+        let max_rounds = if self.config.compaction.model_compaction {
+            self.config.compaction.max_compaction_rounds
+        } else {
+            0
+        };
+        while rounds < max_rounds {
             // Compaction tools mutate persisted history. Rebuild both the conversation
             // and turn-ID/usage instructions so the next round sees those edits.
             let breakdown =
                 self.context_usage_breakdown_with_limit(self.config.compaction.top_consumers);
-            let mut transient_messages = self.messages();
+            let mut transient_messages = self.messages_with_turn_ids();
             transient_messages.push(ChatMessage::system(compaction::instruction(
                 &self.config.compaction,
                 &breakdown,
+                &compaction::protected_ids(&self.turns, &self.config.compaction),
             )));
             let response = self
                 .send_provider_request(provider, transient_messages, compaction_tool_definitions())
@@ -580,6 +620,22 @@ impl ChatSession {
 
             if self.estimated_context_tokens() <= self.config.compaction.target_estimated_tokens {
                 break;
+            }
+        }
+
+        if self.config.compaction.trim_oldest {
+            let before_trim = self.estimated_context_tokens();
+            let removed_turns = compaction::trim_oldest(
+                &mut self.turns,
+                &mut self.next_turn_id,
+                &self.config.compaction,
+            );
+            if removed_turns > 0 {
+                self.emit(AgentEvent::CompactionTrimmed {
+                    removed_turns,
+                    before_estimated_tokens: before_trim,
+                    after_estimated_tokens: self.estimated_context_tokens(),
+                });
             }
         }
 
@@ -696,6 +752,18 @@ impl ChatSession {
         call: &ToolCall,
         round: Option<usize>,
     ) -> ToolResult {
+        self.execute_tool_call_checked(registry, call, round)
+            .await
+            .0
+    }
+
+    /// Execute one call, reporting errors to the model; the flag tells whether it succeeded.
+    async fn execute_tool_call_checked(
+        &mut self,
+        registry: &ToolRegistry,
+        call: &ToolCall,
+        round: Option<usize>,
+    ) -> (ToolResult, bool) {
         if let Some(round) = round {
             self.emit(AgentEvent::ToolCallStarted {
                 round,
@@ -710,8 +778,10 @@ impl ChatSession {
         }
         self.emit_tool_call_started_telemetry(call);
 
+        let mut ok = false;
         let result = match registry.execute_call(call).await {
             Ok(result) => {
+                ok = true;
                 if let Some(round) = round {
                     self.emit(AgentEvent::ToolCallFinished {
                         round,
@@ -737,7 +807,7 @@ impl ChatSession {
             }
         };
         self.push(result.clone().into_message());
-        result
+        (result, ok)
     }
 
     fn emit(&self, event: AgentEvent) {
